@@ -1288,7 +1288,7 @@ async fn rust_bindgen_zenoh_sync() -> anyhow::Result<()> {
 async fn rust_bindgen_zenoh_async() -> anyhow::Result<()> {
     wrpc_test::with_zenoh(|_, zenoh_client| {
         async {
-            let clt = wrpc_transport_zenoh::Client::new(zenoh_client, "rust-bindgen-sync")
+            let clt = wrpc_transport_zenoh::Client::new(zenoh_client, "rust-bindgen-async")
                 .await
                 .context("failed to construct client")?;
             let clt = Arc::new(clt);

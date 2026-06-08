@@ -157,9 +157,21 @@ pub async fn start_zenoh() -> anyhow::Result<(
             let port = free_port().await?;
             let listen = format!("tcp/0.0.0.0:{port}");
 
-            let (server, stop_tx) = spawn_server(Command::new("zenohd").args(["-l", &listen]))
-                .await
-                .context("failed to start zenohd server")?;
+            // Isolate this router: don't announce or discover peers via
+            // multicast, and don't gossip about other routers. Otherwise every
+            // test's `zenohd` (parallel runs, plus leftovers from previous
+            // runs) discovers the others and forms a single shared mesh, which
+            // misroutes/duplicates the transport's fire-and-forget handshake
+            // messages and hangs the test (there is no timeout on the path).
+            let (server, stop_tx) = spawn_server(Command::new("zenohd").args([
+                "-l",
+                &listen,
+                "--no-multicast-scouting",
+                "--cfg",
+                "scouting/gossip/enabled:false",
+            ]))
+            .await
+            .context("failed to start zenohd server")?;
 
             // Wait for zenohd to accept connections on the port.
             let mut ready = false;
@@ -200,6 +212,17 @@ pub async fn start_zenoh() -> anyhow::Result<(
                 "connect/endpoints",
                 &json!([format!("tcp/127.0.0.1:{port}")]).to_string(),
             )
+            .unwrap();
+
+        // Connect only to the `zenohd` started above. Disable multicast
+        // scouting and gossip so this session never discovers another test's
+        // router (or a leftover from a previous run); a shared mesh reorders
+        // and duplicates the transport's handshake messages and hangs the test.
+        config
+            .insert_json5("scouting/multicast/enabled", &json!(false).to_string())
+            .unwrap();
+        config
+            .insert_json5("scouting/gossip/enabled", &json!(false).to_string())
             .unwrap();
 
         config

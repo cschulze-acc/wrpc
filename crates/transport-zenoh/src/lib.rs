@@ -43,9 +43,15 @@ fn spawn_async(fut: impl Future<Output = ()> + Send + 'static) {
         Ok(rt) => {
             rt.spawn(fut);
         }
+        // No current runtime (e.g. dropped on a plain OS thread). We must run
+        // `fut` to completion here: spawning onto a freshly created runtime and
+        // letting it drop would race the task against runtime shutdown and
+        // usually cancel it. That silently drops the stream-shutdown (EOF) PUT,
+        // which hangs the peer's reader forever. `block_on` is safe in this arm
+        // because we are provably not inside a runtime.
         Err(_) => match tokio::runtime::Runtime::new() {
             Ok(rt) => {
-                rt.spawn(fut);
+                rt.block_on(fut);
             }
             Err(err) => error!(?err, "failed to create a new Tokio runtime"),
         },
