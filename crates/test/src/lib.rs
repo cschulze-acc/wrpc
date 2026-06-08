@@ -147,28 +147,42 @@ pub async fn start_zenoh() -> anyhow::Result<(
         );
     }
 
-    let port = free_port().await?; // not used in setup -- just return
+    // `free_port` releases the port before `zenohd` binds it, so a concurrent
+    // test can grab the same ephemeral port in between (the tests run in
+    // parallel). Rather than fail outright, retry on a fresh port until one
+    // `zenohd` instance comes up cleanly.
+    let (port, server, stop_tx) = {
+        let mut bound = None;
+        for _ in 0..10 {
+            let port = free_port().await?;
+            let listen = format!("tcp/0.0.0.0:{port}");
 
-    let listen = format!("tcp/0.0.0.0:{port}");
+            let (server, stop_tx) = spawn_server(Command::new("zenohd").args(["-l", &listen]))
+                .await
+                .context("failed to start zenohd server")?;
 
-    let (server, stop_tx) = spawn_server(Command::new("zenohd").args(["-l", &listen]))
-        .await
-        .context("failed to start zenohd server")?;
+            // Wait for zenohd to accept connections on the port.
+            let mut ready = false;
+            for _ in 0..50 {
+                if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                    ready = true;
+                    break;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
 
-    let mut ready = false;
+            if ready {
+                bound = Some((port, server, stop_tx));
+                break;
+            }
 
-    // Check that zenohd is ready
-    for _ in 0..50 {
-        if TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            ready = true;
-            break;
+            // zenohd never opened the port (most likely it lost a race for the
+            // ephemeral port and exited). Tear it down and try another port.
+            let _ = stop_tx.send(());
+            let _ = server.await;
         }
-        sleep(Duration::from_millis(100)).await;
-    }
-
-    if !ready {
-        anyhow::bail!("zenohd did not open port {port}");
-    }
+        bound.context("zenohd did not open a port after multiple attempts")?
+    };
 
     let cfg = if let Ok(cfg) = Config::from_env() {
         cfg
@@ -194,6 +208,26 @@ pub async fn start_zenoh() -> anyhow::Result<(
     let session = zenoh::open(cfg).await.unwrap();
 
     let arc_session = Arc::new(session);
+
+    // `zenoh::open` returns before the client session has actually connected to
+    // the zenohd router; the connection is established in the background. Wait
+    // until at least one router is reachable so callers don't race serve/invoke
+    // traffic against connection establishment.
+    let mut connected = false;
+    for _ in 0..50 {
+        let mut routers = arc_session.info().routers_zid().await;
+        if routers.next().is_some() {
+            connected = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    if !connected {
+        let _ = stop_tx.send(());
+        let _ = server.await;
+        anyhow::bail!("zenoh session did not connect to the zenohd router on port {port}");
+    }
 
     Ok((port, arc_session, server, stop_tx))
 }
