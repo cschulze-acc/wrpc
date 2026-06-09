@@ -30,3 +30,7 @@ uuid = { workspace = true }
 flume = { workspace = true }
 postcard = {workspace = true, features = ["use-std"]}
 hotpath = "0.13.0"
+
+[dev-dependencies]
+test-log = { workspace = true, features = ["color", "log", "trace"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

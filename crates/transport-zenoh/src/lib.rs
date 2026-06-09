@@ -1243,3 +1243,367 @@ impl wrpc_transport::Serve for Client {
         Ok(stream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use core::time::Duration;
+    use std::io::ErrorKind;
+
+    use tokio::io::AsyncReadExt as _;
+    use zenoh::key_expr::KeyExpr;
+    use zenoh::sample::{Sample, SampleBuilder};
+
+    /// Build a detached [`Subscriber`] identified by `subject`, returning the sender side of its
+    /// channel so a test can feed it [`Sample`]s. The command receiver is dropped: these
+    /// subscribers are never wired into a real dispatch loop.
+    fn test_sub(subject: &str) -> (Subscriber, mpsc::Sender<Sample>) {
+        let (tx, rx) = mpsc::channel::<Sample>(8);
+        let (cmd_tx, _cmd_rx) = mpsc::channel::<Command>(8);
+        let sub = Subscriber {
+            rx: ReceiverStream::new(rx),
+            subject: subject.into(),
+            commands: cmd_tx,
+            tasks: Arc::new(JoinSet::new()),
+        };
+        (sub, tx)
+    }
+
+    /// Construct a `PUT` [`Sample`] with the given payload (no network/session required).
+    fn sample(payload: &[u8]) -> Sample {
+        SampleBuilder::put(KeyExpr::try_from("test/key").unwrap(), payload.to_vec()).into()
+    }
+
+    fn empty_trie() -> Arc<std::sync::Mutex<IndexTrie>> {
+        Arc::new(std::sync::Mutex::new(IndexTrie::Empty))
+    }
+
+    // ---- Group 1: subject / path builders -------------------------------------------------
+
+    #[test]
+    fn param_and_result_subjects() {
+        assert_eq!(param_subject("a/b"), "a/b/params");
+        assert_eq!(result_subject("a/b"), "a/b/results");
+    }
+
+    #[test]
+    fn index_path_cases() {
+        assert_eq!(index_path("r", &[0, 2]), "r/0/2");
+        assert_eq!(index_path("", &[1]), "1");
+        assert_eq!(index_path("r", &[]), "r");
+        assert_eq!(index_path("", &[]), "");
+    }
+
+    #[test]
+    fn subscribe_path_cases() {
+        assert_eq!(subscribe_path("p", &[Some(1), None, Some(2)]), "p/1/*/2");
+        assert_eq!(subscribe_path("", &[Some(1), None]), "1/*");
+        assert_eq!(subscribe_path("", &[None]), "*");
+        assert_eq!(subscribe_path("p", &[]), "p");
+    }
+
+    #[test]
+    fn invocation_subject_cases() {
+        assert_eq!(
+            invocation_subject("p", "inst", "f"),
+            format!("p/{PROTOCOL}/inst/f")
+        );
+        assert_eq!(invocation_subject("p", "", "f"), format!("p/{PROTOCOL}/f"));
+        assert_eq!(
+            invocation_subject("", "inst", "f"),
+            format!("{PROTOCOL}/inst/f")
+        );
+        assert_eq!(invocation_subject("", "", "f"), format!("{PROTOCOL}/f"));
+    }
+
+    #[test]
+    fn child_inbox_format_and_uniqueness() {
+        let a = child_inbox("base");
+        assert!(a.starts_with("base/"), "{a:?}");
+        assert!(a.len() > "base/".len());
+
+        // A trailing slash on the base must not produce a doubled separator.
+        let b = child_inbox("base/");
+        assert!(b.starts_with("base/"), "{b:?}");
+        assert!(!b.contains("//"), "{b:?}");
+
+        // nuid suffix makes each call unique.
+        assert_ne!(child_inbox("base"), child_inbox("base"));
+    }
+
+    // ---- Group 2: zbytes_as_bytes ---------------------------------------------------------
+
+    #[test]
+    fn zbytes_round_trip() {
+        assert_eq!(
+            zbytes_as_bytes(&ZBytes::from(&b"hello"[..])),
+            Bytes::from_static(b"hello")
+        );
+        assert!(zbytes_as_bytes(&ZBytes::from(&[][..])).is_empty());
+    }
+
+    // ---- Group 3: IndexTrie ---------------------------------------------------------------
+
+    #[test_log::test(tokio::test)]
+    async fn trie_empty() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.is_empty());
+        assert!(trie.take(&[0]).is_none());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_insert_take_single() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[Some(0)], test_sub("a").0));
+        assert!(!trie.is_empty());
+        assert_eq!(trie.take(&[0]).unwrap().subject, "a");
+        // Taking again yields nothing.
+        assert!(trie.take(&[0]).is_none());
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_siblings() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[Some(0)], test_sub("a").0));
+        assert!(trie.insert(&[Some(1)], test_sub("b").0));
+        assert!(trie.insert(&[Some(2)], test_sub("c").0));
+        assert_eq!(trie.take(&[1]).unwrap().subject, "b");
+        assert_eq!(trie.take(&[0]).unwrap().subject, "a");
+        assert_eq!(trie.take(&[2]).unwrap().subject, "c");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_nested_index() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[Some(0), Some(1)], test_sub("x").0));
+        // No subscriber sits directly at [0]; only the nested one at [0, 1].
+        assert!(trie.take(&[0]).is_none());
+        assert_eq!(trie.take(&[0, 1]).unwrap().subject, "x");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_subscriber_and_nested_coexist() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[Some(0)], test_sub("a").0));
+        assert!(trie.insert(&[Some(0), Some(1)], test_sub("b").0));
+        assert_eq!(trie.take(&[0]).unwrap().subject, "a");
+        // Taking the parent leaves the nested child reachable.
+        assert_eq!(trie.take(&[0, 1]).unwrap().subject, "b");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_from_iter() {
+        let mut trie: IndexTrie = [
+            (vec![Some(0)], test_sub("a").0),
+            (vec![Some(1)], test_sub("b").0),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(trie.take(&[0]).unwrap().subject, "a");
+        assert_eq!(trie.take(&[1]).unwrap().subject, "b");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_insert_failures() {
+        // Empty path into a root Leaf.
+        let mut leaf = IndexTrie::from((&[][..], test_sub("leaf").0));
+        assert!(matches!(leaf, IndexTrie::Leaf(_)));
+        assert!(!leaf.insert(&[], test_sub("z").0));
+
+        // Wildcard path into an IndexNode.
+        let mut index = IndexTrie::Empty;
+        assert!(index.insert(&[Some(0)], test_sub("a").0));
+        assert!(!index.insert(&[None], test_sub("z").0));
+
+        // Indexed path into a WildcardNode.
+        let mut wildcard = IndexTrie::Empty;
+        assert!(wildcard.insert(&[None], test_sub("w").0));
+        assert!(!wildcard.insert(&[Some(0)], test_sub("z").0));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn trie_wildcard_is_currently_unreachable_via_take() {
+        // Documents the commented-out demux TODO: a subscriber inserted under a wildcard
+        // path cannot currently be retrieved with `take`.
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[None], test_sub("w").0));
+        assert!(!trie.is_empty());
+        assert!(trie.take(&[0]).is_none());
+        assert!(trie.take(&[]).is_none());
+    }
+
+    // ---- Group 4: Reader::poll_read -------------------------------------------------------
+
+    fn reader_with_buffer(buffer: &'static [u8]) -> Reader {
+        Reader {
+            buffer: Bytes::from_static(buffer),
+            incoming: None,
+            nested: empty_trie(),
+            path: Box::default(),
+        }
+    }
+
+    fn reader_with_incoming(sub: Subscriber) -> Reader {
+        Reader {
+            buffer: Bytes::default(),
+            incoming: Some(sub),
+            nested: empty_trie(),
+            path: Box::default(),
+        }
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_drains_full_buffer() {
+        let mut r = reader_with_buffer(b"hello");
+        let mut buf = [0u8; 16];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_drains_buffer_in_chunks() {
+        let mut r = reader_with_buffer(b"hello");
+        let mut buf = [0u8; 3];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hel");
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"lo");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_without_incoming_is_not_found() {
+        let mut r = reader_with_buffer(b"");
+        let mut buf = [0u8; 8];
+        let err = r.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_empty_payload_is_eof() {
+        let (sub, tx) = test_sub("inbox");
+        let mut r = reader_with_incoming(sub);
+        // Empty payload is the stream-shutdown (EOF) marker.
+        tx.send(sample(b"")).await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_reads_payload_then_eof() {
+        let (sub, tx) = test_sub("inbox");
+        let mut r = reader_with_incoming(sub);
+        tx.send(sample(b"abc")).await.unwrap();
+        let mut buf = [0u8; 8];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"abc");
+        // Dropping the sender ends the stream -> EOF.
+        drop(tx);
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn reader_payload_larger_than_buffer() {
+        let (sub, tx) = test_sub("inbox");
+        let mut r = reader_with_incoming(sub);
+        tx.send(sample(b"hello")).await.unwrap();
+        let mut buf = [0u8; 3];
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hel");
+        // Remainder is buffered and returned on the next read.
+        let n = r.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"lo");
+    }
+
+    // ---- Group 5: ByteSubscription stream -------------------------------------------------
+
+    #[test_log::test(tokio::test)]
+    async fn byte_subscription_yields_payloads() {
+        let (sub, tx) = test_sub("inbox");
+        let mut stream = ByteSubscription(sub);
+        tx.send(sample(b"abc")).await.unwrap();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        // Unlike Reader, an empty payload is just empty bytes (no EOF semantics here).
+        tx.send(sample(b"")).await.unwrap();
+        assert!(stream.next().await.unwrap().unwrap().is_empty());
+        // Sender dropped -> stream ends.
+        drop(tx);
+        assert!(stream.next().await.is_none());
+    }
+
+    // ---- Group 6: Reader::index -----------------------------------------------------------
+
+    #[test_log::test(tokio::test)]
+    async fn reader_index_navigates_trie() {
+        let mut trie = IndexTrie::Empty;
+        assert!(trie.insert(&[Some(0)], test_sub("a").0));
+        assert!(trie.insert(&[Some(1)], test_sub("b").0));
+        let r = Reader {
+            buffer: Bytes::default(),
+            incoming: None,
+            nested: Arc::new(std::sync::Mutex::new(trie)),
+            path: Box::default(),
+        };
+
+        let indexed = r.index(&[0]).unwrap();
+        assert_eq!(indexed.incoming.as_ref().unwrap().subject, "a");
+        assert_eq!(indexed.path.as_ref(), &[0]);
+
+        // Empty path is rejected.
+        assert!(r.index(&[]).is_err());
+
+        // Absent path -> no subscriber -> subsequent read is NotFound.
+        let mut missing = r.index(&[2]).unwrap();
+        assert!(missing.incoming.is_none());
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            missing.read(&mut buf).await.unwrap_err().kind(),
+            ErrorKind::NotFound
+        );
+    }
+
+    // ---- Group 7: spawn_async regression guards (pin the off-runtime EOF fix) --------------
+
+    #[test]
+    fn spawn_async_runs_future_off_runtime() {
+        // This `#[test]` runs on a thread with no Tokio runtime, exercising the fallback that
+        // previously spawned-then-dropped a runtime and silently cancelled the task. The
+        // `sleep` introduces a yield point (as the real stream-shutdown PUT has): under the old
+        // `rt.spawn`-then-drop the task would be cancelled at the await and never send; only
+        // `block_on` drives it to completion.
+        let (tx, rx) = std::sync::mpsc::channel();
+        spawn_async(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("spawn_async must run the future to completion when off-runtime");
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn spawn_async_runs_future_on_runtime() {
+        let (tx, rx) = oneshot::channel();
+        spawn_async(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(());
+        });
+        tokio::time::timeout(Duration::from_secs(5), rx)
+            .await
+            .expect("spawn_async future must run on the current runtime")
+            .expect("sender dropped without sending");
+    }
+
+    // ---- Misc -----------------------------------------------------------------------------
+
+    #[test]
+    fn corrupted_memory_error_is_other() {
+        let err = corrupted_memory_error();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert!(err.to_string().contains("corrupted memory state"));
+    }
+}

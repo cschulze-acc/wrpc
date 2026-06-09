@@ -7164,6 +7164,7 @@ dependencies = [
  "nuid",
  "postcard",
  "serde",
+ "test-log",
  "tokio",
  "tokio-stream",
  "tokio-util",
