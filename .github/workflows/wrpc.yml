@@ -106,7 +106,7 @@ jobs:
     name: wrpc-${{ matrix.config.target }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -149,7 +149,7 @@ jobs:
       - run: chmod +x ./artifact/bin/wrpc-wasmtime
       - run: ./artifact/bin/wrpc-wasmtime --version
 
-      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: wrpc-universal-darwin
           path: artifact
@@ -190,7 +190,7 @@ jobs:
     name: cargo ${{ matrix.check }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -257,7 +257,7 @@ jobs:
     needs: cargo
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Extract tag context
         id: ctx
@@ -292,7 +292,7 @@ jobs:
   build-doc:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -310,7 +310,7 @@ jobs:
             <meta http-equiv="refresh" content="0; URL=wrpc/index.html">
             <link rel="canonical" href="https://${{ github.repository_owner }}.github.io/wrpc/wrpc/index.html">
           EOF
-      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: doc
 
@@ -325,7 +325,7 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+      - uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0
         id: deployment
 
   oci:
@@ -333,11 +333,15 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       packages: write
+    env:
+      # The runner ships a v1-format /etc/containers/registries.conf, which the
+      # newer skopeo from nixpkgs-unstable rejects. Point it at our own v2 file.
+      CONTAINERS_REGISTRIES_CONF: ${{ github.workspace }}/.github/registries.conf
     needs:
       - build-bin
       - test-linux
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: ./.github/actions/install-nix
         with:
           cachixAuthToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
@@ -358,11 +362,14 @@ jobs:
 
       - name: Login to GitHub Container Registry
         if: startswith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
-        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4.0.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write v2 `registries.conf`
+        run: printf 'unqualified-search-registries = ["docker.io"]\n' > "${CONTAINERS_REGISTRIES_CONF}"
 
       - name: Install `skopeo`
         run: nix profile install --inputs-from . 'nixpkgs-unstable#skopeo'
@@ -411,7 +418,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Extract tag context
         id: ctx
@@ -458,7 +465,7 @@ jobs:
             done
           done
 
-      - uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+      - uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           draft: true
           prerelease: true

@@ -4,7 +4,6 @@ use core::pin::pin;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context as _};
 use bytes::BytesMut;
 use futures::future::try_join_all;
 use tokio::io::AsyncWriteExt as _;
@@ -13,7 +12,8 @@ use tokio::try_join;
 use tokio_util::codec::Encoder;
 use tracing::{debug, instrument, trace, warn, Instrument as _, Span};
 use wasmtime::component::{types, LinkerInstance, ResourceType, Type, Val};
-use wasmtime::{AsContextMut, Engine, StoreContextMut};
+use wasmtime::error::Context as _;
+use wasmtime::{bail, ensure, AsContextMut, Engine, StoreContextMut};
 use wrpc_transport::{Index as _, Invoke, InvokeExt as _};
 
 use crate::rpc::Error;
@@ -145,7 +145,7 @@ async fn invoke<T: WrpcView>(
     let mut buf = BytesMut::default();
     let mut deferred = vec![];
     for (v, (name, ref ty)) in zip(params, params_ty) {
-        let mut enc = ValEncoder::new(store.as_context_mut(), ty, &guest_resources);
+        let mut enc = ValEncoder::new(store.as_context_mut(), ty, &guest_resources, &[]);
         enc.encode(v, &mut buf)
             .with_context(|| format!("failed to encode parameter `{name}`"))?;
         deferred.push(enc.deferred);
@@ -165,18 +165,21 @@ async fn invoke<T: WrpcView>(
             .await
     } else {
         clt.invoke(cx, &instance, rpc_name, buf, paths).await
-    }
-    .with_context(|| format!("failed to invoke `{instance}.{name}` polyfill via wRPC"));
+    };
     let (outgoing, incoming) = match invocation {
         Ok((outgoing, incoming)) => (outgoing, incoming),
-        Err(err) => return Ok(Err(err)),
+        Err(err) => {
+            return Ok(Err(err.context(format!(
+                "failed to invoke `{instance}.{name}` polyfill via wRPC"
+            ))))
+        }
     };
     let tx = async {
         try_join_all(
             zip(0.., deferred)
                 .filter_map(|(i, f)| f.map(|f| (outgoing.index(&[i]), f)))
                 .map(|(w, f)| async move {
-                    let w = w?;
+                    let w = w.map_err(wasmtime::Error::from_anyhow)?;
                     f(w).await
                 }),
         )
@@ -190,16 +193,24 @@ async fn invoke<T: WrpcView>(
         if let Err(err) = outgoing.shutdown().await {
             trace!(?err, "failed to shutdown outgoing stream");
         }
-        anyhow::Ok(())
+        wasmtime::error::Ok(())
     };
     let rx = async {
         let mut incoming = pin!(incoming);
         for (i, (v, ref ty)) in zip(results, results_ty).enumerate() {
-            read_value(&mut store, &mut incoming, &guest_resources, v, ty, &[i])
-                .await
-                .with_context(|| format!("failed to decode return value {i}"))?;
+            read_value(
+                &mut store,
+                &mut incoming,
+                &guest_resources,
+                &[],
+                v,
+                ty,
+                &[i],
+            )
+            .await
+            .with_context(|| format!("failed to decode return value {i}"))?;
         }
-        Ok(())
+        wasmtime::error::Ok(())
     };
     let res = if let Some(timeout) = timeout {
         let timeout = timeout.saturating_sub(Instant::now().saturating_duration_since(start));
@@ -220,7 +231,7 @@ async fn invoke<T: WrpcView>(
     };
     match res {
         Ok(((), ())) => Ok(Ok(())),
-        Err(err) => Ok(Err(err)),
+        Err(err) => Ok(Err(err.into())),
     }
 }
 
@@ -262,7 +273,7 @@ where
                     .await
                     {
                         Ok(Ok(())) => Ok(()),
-                        Ok(Err(err)) => Err(err),
+                        Ok(Err(err)) => Err(wasmtime::Error::from_anyhow(err)),
                         Err(err) => Err(err),
                     }
                 }

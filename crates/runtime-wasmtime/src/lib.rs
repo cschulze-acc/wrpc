@@ -11,7 +11,7 @@ use core::time::Duration;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::anyhow;
 use bytes::{Bytes, BytesMut};
 use futures::future::try_join_all;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
@@ -21,7 +21,8 @@ use uuid::Uuid;
 use wasmtime::component::{
     types, Func, Resource, ResourceAny, ResourceTable, ResourceType, Type, Val,
 };
-use wasmtime::{AsContextMut, Engine};
+use wasmtime::error::Context as _;
+use wasmtime::{bail, AsContextMut, Engine};
 use wrpc_transport::Invoke;
 
 use crate::bindings::rpc::context::Context;
@@ -30,6 +31,7 @@ use crate::bindings::rpc::transport::{IncomingChannel, Invocation, OutgoingChann
 
 pub mod bindings;
 mod codec;
+pub mod paths;
 mod polyfill;
 pub mod rpc;
 mod serve;
@@ -128,7 +130,7 @@ pub trait WrpcViewExt: WrpcView {
                 )>,
             > + Send
             + 'static,
-    ) -> anyhow::Result<Resource<Invocation>> {
+    ) -> wasmtime::Result<Resource<Invocation>> {
         self.wrpc()
             .table
             .push(Invocation::Future(Box::pin(async move {
@@ -141,7 +143,7 @@ pub trait WrpcViewExt: WrpcView {
     fn get_invocation_result(
         &mut self,
         invocation: &Resource<Invocation>,
-    ) -> anyhow::Result<
+    ) -> wasmtime::Result<
         Option<
             &Box<
                 anyhow::Result<(
@@ -168,7 +170,7 @@ pub trait WrpcViewExt: WrpcView {
     fn delete_invocation(
         &mut self,
         invocation: Resource<Invocation>,
-    ) -> anyhow::Result<
+    ) -> wasmtime::Result<
         impl Future<
             Output = anyhow::Result<(
                 <Self::Invoke as Invoke>::Outgoing,
@@ -196,7 +198,7 @@ pub trait WrpcViewExt: WrpcView {
     fn push_outgoing_channel(
         &mut self,
         outgoing: <Self::Invoke as Invoke>::Outgoing,
-    ) -> anyhow::Result<Resource<OutgoingChannel>> {
+    ) -> wasmtime::Result<Resource<OutgoingChannel>> {
         self.wrpc()
             .table
             .push(OutgoingChannel(Arc::new(std::sync::RwLock::new(Box::new(
@@ -208,7 +210,7 @@ pub trait WrpcViewExt: WrpcView {
     fn delete_outgoing_channel(
         &mut self,
         outgoing: Resource<OutgoingChannel>,
-    ) -> anyhow::Result<<Self::Invoke as Invoke>::Outgoing> {
+    ) -> wasmtime::Result<<Self::Invoke as Invoke>::Outgoing> {
         let OutgoingChannel(outgoing) = self
             .wrpc()
             .table
@@ -221,14 +223,14 @@ pub trait WrpcViewExt: WrpcView {
         };
         let outgoing = outgoing
             .downcast()
-            .map_err(|_| anyhow!("invalid outgoing channel type"))?;
+            .map_err(|_| wasmtime::Error::msg("invalid outgoing channel type"))?;
         Ok(*outgoing)
     }
 
     fn push_incoming_channel(
         &mut self,
         incoming: <Self::Invoke as Invoke>::Incoming,
-    ) -> anyhow::Result<Resource<IncomingChannel>> {
+    ) -> wasmtime::Result<Resource<IncomingChannel>> {
         self.wrpc()
             .table
             .push(IncomingChannel(Arc::new(std::sync::RwLock::new(Box::new(
@@ -240,7 +242,7 @@ pub trait WrpcViewExt: WrpcView {
     fn delete_incoming_channel(
         &mut self,
         incoming: Resource<IncomingChannel>,
-    ) -> anyhow::Result<<Self::Invoke as Invoke>::Incoming> {
+    ) -> wasmtime::Result<<Self::Invoke as Invoke>::Incoming> {
         let IncomingChannel(incoming) = self
             .wrpc()
             .table
@@ -253,18 +255,18 @@ pub trait WrpcViewExt: WrpcView {
         };
         let incoming = incoming
             .downcast()
-            .map_err(|_| anyhow!("invalid incoming channel type"))?;
+            .map_err(|_| wasmtime::Error::msg("invalid incoming channel type"))?;
         Ok(*incoming)
     }
 
-    fn push_error(&mut self, error: Error) -> anyhow::Result<Resource<Error>> {
+    fn push_error(&mut self, error: Error) -> wasmtime::Result<Resource<Error>> {
         self.wrpc()
             .table
             .push(error)
             .context("failed to push error to table")
     }
 
-    fn get_error(&mut self, error: &Resource<Error>) -> anyhow::Result<&Error> {
+    fn get_error(&mut self, error: &Resource<Error>) -> wasmtime::Result<&Error> {
         let error = self
             .wrpc()
             .table
@@ -273,7 +275,7 @@ pub trait WrpcViewExt: WrpcView {
         Ok(error)
     }
 
-    fn get_error_mut(&mut self, error: &Resource<Error>) -> anyhow::Result<&mut Error> {
+    fn get_error_mut(&mut self, error: &Resource<Error>) -> wasmtime::Result<&mut Error> {
         let error = self
             .wrpc()
             .table
@@ -282,7 +284,7 @@ pub trait WrpcViewExt: WrpcView {
         Ok(error)
     }
 
-    fn delete_error(&mut self, error: Resource<Error>) -> anyhow::Result<Error> {
+    fn delete_error(&mut self, error: Resource<Error>) -> wasmtime::Result<Error> {
         let error = self
             .wrpc()
             .table
@@ -294,7 +296,7 @@ pub trait WrpcViewExt: WrpcView {
     fn push_context(
         &mut self,
         cx: <Self::Invoke as Invoke>::Context,
-    ) -> anyhow::Result<Resource<Context>>
+    ) -> wasmtime::Result<Resource<Context>>
     where
         <Self::Invoke as Invoke>::Context: 'static,
     {
@@ -307,7 +309,7 @@ pub trait WrpcViewExt: WrpcView {
     fn delete_context(
         &mut self,
         cx: Resource<Context>,
-    ) -> anyhow::Result<<Self::Invoke as Invoke>::Context>
+    ) -> wasmtime::Result<<Self::Invoke as Invoke>::Context>
     where
         <Self::Invoke as Invoke>::Context: 'static,
     {
@@ -316,7 +318,9 @@ pub trait WrpcViewExt: WrpcView {
             .table
             .delete(cx)
             .context("failed to delete context from table")?;
-        let cx = cx.downcast().map_err(|_| anyhow!("invalid context type"))?;
+        let cx = cx
+            .downcast()
+            .map_err(|_| wasmtime::Error::msg("invalid context type"))?;
         Ok(*cx)
     }
 }
@@ -325,15 +329,15 @@ impl<T: WrpcView> WrpcViewExt for T {}
 
 /// Error type returned by [call]
 pub enum CallError {
-    Decode(anyhow::Error),
-    Encode(anyhow::Error),
-    Table(anyhow::Error),
-    Call(anyhow::Error),
-    TypeMismatch(anyhow::Error),
-    Write(anyhow::Error),
-    Flush(anyhow::Error),
-    Deferred(anyhow::Error),
-    PostReturn(anyhow::Error),
+    Decode(wasmtime::Error),
+    Encode(wasmtime::Error),
+    Table(wasmtime::Error),
+    Call(wasmtime::Error),
+    TypeMismatch(wasmtime::Error),
+    Write(wasmtime::Error),
+    Flush(wasmtime::Error),
+    Deferred(wasmtime::Error),
+    PostReturn(wasmtime::Error),
     Guest(Error),
 }
 
@@ -380,6 +384,7 @@ pub async fn call<C, I, O>(
     mut tx: O,
     guest_resources: &[ResourceType],
     host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
+    io_streams: &[ResourceType],
     params_ty: impl ExactSizeIterator<Item = &Type>,
     results_ty: &[Type],
     func: Func,
@@ -393,10 +398,18 @@ where
     let mut params = vec![Val::Bool(false); params_ty.len()];
     let mut rx = pin!(rx);
     for (i, (v, ty)) in zip(&mut params, params_ty).enumerate() {
-        read_value(&mut store, &mut rx, guest_resources, v, ty, &[i])
-            .await
-            .with_context(|| format!("failed to decode parameter value {i}"))
-            .map_err(CallError::Decode)?;
+        read_value(
+            &mut store,
+            &mut rx,
+            guest_resources,
+            io_streams,
+            v,
+            ty,
+            &[i],
+        )
+        .await
+        .with_context(|| format!("failed to decode parameter value {i}"))
+        .map_err(CallError::Decode)?;
     }
     let mut results = vec![Val::Bool(false); results_ty.len()];
     func.call_async(&mut store, &params, &mut results)
@@ -412,7 +425,8 @@ where
     ) {
         (None, results) => {
             for (i, (v, ty)) in zip(results, results_ty).enumerate() {
-                let mut enc = ValEncoder::new(store.as_context_mut(), ty, guest_resources);
+                let mut enc =
+                    ValEncoder::new(store.as_context_mut(), ty, guest_resources, io_streams);
                 enc.encode(v, &mut buf)
                     .with_context(|| format!("failed to encode result value {i}"))
                     .map_err(CallError::Encode)?;
@@ -423,7 +437,7 @@ where
         (Some(None), [Val::Result(Ok(None))]) => {}
         // `result<T, rpc-eror>`
         (Some(Some(ty)), [Val::Result(Ok(Some(v)))]) => {
-            let mut enc = ValEncoder::new(store.as_context_mut(), ty, guest_resources);
+            let mut enc = ValEncoder::new(store.as_context_mut(), ty, guest_resources, io_streams);
             enc.encode(v, &mut buf)
                 .context("failed to encode result value 0")
                 .map_err(CallError::Encode)?;
@@ -431,8 +445,8 @@ where
         }
         (Some(..), [Val::Result(Err(Some(err)))]) => {
             let Val::Resource(err) = &**err else {
-                return Err(CallError::TypeMismatch(anyhow!(
-                    "RPC result error value is not a resource"
+                return Err(CallError::TypeMismatch(wasmtime::Error::msg(
+                    "RPC result error value is not a resource",
                 )));
             };
             let mut store = store.as_context_mut();
@@ -446,7 +460,11 @@ where
                 .map_err(CallError::Table)?;
             return Err(CallError::Guest(err));
         }
-        _ => return Err(CallError::TypeMismatch(anyhow!("RPC result type mismatch"))),
+        _ => {
+            return Err(CallError::TypeMismatch(wasmtime::Error::msg(
+                "RPC result type mismatch",
+            )))
+        }
     }
 
     debug!("transmitting results");
@@ -465,16 +483,12 @@ where
         zip(0.., deferred)
             .filter_map(|(i, f)| f.map(|f| (tx.index(&[i]), f)))
             .map(|(w, f)| async move {
-                let w = w?;
+                let w = w.map_err(wasmtime::Error::from_anyhow)?;
                 f(w).await
             }),
     )
     .await
     .map_err(CallError::Deferred)?;
-    func.post_return_async(&mut store)
-        .await
-        .context("failed to perform post-return cleanup")
-        .map_err(CallError::PostReturn)?;
     Ok(())
 }
 

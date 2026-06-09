@@ -34,9 +34,7 @@ fn spawn_async(fut: impl Future<Output = ()> + Send + 'static) {
             rt.spawn(fut);
         }
         Err(_) => match tokio::runtime::Runtime::new() {
-            Ok(rt) => {
-                rt.spawn(fut);
-            }
+            Ok(rt) => rt.block_on(fut),
             Err(err) => error!(?err, "failed to create a new Tokio runtime"),
         },
     }
@@ -198,6 +196,7 @@ impl Client {
             .subscribe(Subject::from(subject))
             .await
             .context("failed to subscribe on an inbox subject")?;
+        nats.flush().await.context("failed to flush")?;
 
         let mut tasks = JoinSet::new();
         let (cmd_tx, mut cmd_rx) = mpsc::channel(8192);
@@ -249,8 +248,18 @@ impl Client {
                 let mut subs = HashMap::new();
                 loop {
                     select! {
-                        Some(msg) = sub.next() => handle_message(&mut subs, msg).await,
+                        // NOTE: `biased` ensures that pending subscription commands are always
+                        // applied before incoming messages are routed. Every wRPC subscription is
+                        // registered via `Command::Subscribe` before the matching data is
+                        // published, but both reach this single demux task as independent ready
+                        // events. Without biasing, `select!` picks a ready branch at random and may
+                        // route a message before its `Subscribe` command is applied, dropping it as
+                        // having "no subscriber" and hanging the consumer forever. This races more
+                        // easily under load, when the task is scheduled less frequently and a
+                        // queued command and an arrived message are both ready in the same poll.
+                        biased;
                         Some(cmd) = cmd_rx.recv() => handle_command(&mut subs, cmd),
+                        Some(msg) = sub.next() => handle_message(&mut subs, msg).await,
                         else => return,
                     }
                 }
@@ -623,10 +632,15 @@ impl AsyncWrite for SubjectWriter {
 
     #[instrument(level = "trace", skip_all, ret, fields(subject = self.tx.as_str()))]
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        trace!("writing stream shutdown message");
-        ready!(self.as_mut().poll_write(cx, &[]))?;
-        self.shutdown = true;
-        Poll::Ready(Ok(()))
+        if !self.shutdown {
+            trace!("writing stream shutdown message");
+            ready!(self.as_mut().poll_write(cx, &[]))?;
+            self.shutdown = true;
+        }
+        trace!("flushing");
+        self.nats
+            .poll_flush_unpin(cx)
+            .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
     }
 }
 
@@ -1114,12 +1128,7 @@ impl wrpc_transport::Invoke for Client {
                 .await
         }
         .context("failed to publish handshake")?;
-        let nats = Arc::clone(&self.nats);
-        tokio::spawn(async move {
-            if let Err(err) = nats.flush().await {
-                error!(?err, "failed to flush");
-            }
-        });
+        self.nats.flush().await.context("failed to flush")?;
         Ok((
             ParamWriter::Root(RootParamWriter::new(
                 (*self.nats).clone(),
@@ -1195,6 +1204,7 @@ async fn handle_message(
     nats.publish_with_reply(tx.clone(), rx, Bytes::default())
         .await
         .context("failed to publish handshake accept")?;
+    nats.flush().await.context("failed to flush")?;
     Ok((
         NatsContext { headers, subject },
         SubjectWriter::new(
@@ -1240,6 +1250,7 @@ impl wrpc_transport::Serve for Client {
             debug!(subject, "subscribing on invocation subject");
             self.nats.subscribe(subject).await?
         };
+        self.nats.flush().await.context("failed to flush")?;
         let nats = Arc::clone(&self.nats);
         let paths = paths.into();
         let commands = self.commands.clone();
