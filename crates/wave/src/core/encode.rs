@@ -5,7 +5,7 @@ use core::ops::{BitOrAssign, Shl};
 
 use std::collections::HashSet;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use bytes::{BufMut as _, BytesMut};
 use tokio_util::codec::Encoder;
 use tracing::instrument;
@@ -13,7 +13,7 @@ use wasm_tokio::{CoreNameEncoder, Leb128Encoder, Utf8Codec};
 use wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue};
 
 /// Encoder for wasm-wave values with type information stored in the encoder.
-/// This mirrors the `ValEncoder` from `wrpc-runtime-wasmtime`.
+/// This mirrors the `ValEncoder` from `wrpc-wasmtime`.
 ///
 /// ## Usage
 ///
@@ -90,7 +90,7 @@ fn flag_bits<'a, T: BitOrAssign + Shl<u8, Output = T> + From<u8>>(
 }
 
 // Generic implementation for any type implementing WasmValue and WasmType
-impl<'a, V, T> Encoder<&V> for WaveEncoder<'a, T>
+impl<V, T> Encoder<&V> for WaveEncoder<'_, T>
 where
     V: WasmValue<Type = T>,
     T: WasmType,

@@ -3,24 +3,24 @@
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf, SocketAddr};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tracing::instrument;
 
-use crate::frame::{invoke, Accept, Incoming, Outgoing};
 use crate::Invoke;
+use crate::frame::{Incoming, Outgoing, invoke};
 
-/// [Invoke] and [Accept] implementation in terms of a single [`UnixStream`].
+/// [Invoke] implementation in terms of a single [`UnixStream`].
 ///
-/// Either [`Invoke::invoke`] or [`Accept::accept`] can only be called at most once
-/// on [Oneshot], repeated calls with return an error
+/// [`Invoke::invoke`] can only be called at most once on [Oneshot],
+/// repeated calls will return an error.
 pub type Oneshot = super::Oneshot<OwnedReadHalf, OwnedWriteHalf>;
 
 impl Oneshot {
-    /// Creates a pair of connected [Oneshot] using [UnixStream::pair].
-    pub fn unix_pair() -> std::io::Result<(Oneshot, Oneshot)> {
-        let (a, b) = UnixStream::pair()?;
-        Ok((a.into(), b.into()))
+    /// Creates a pair of connected [Oneshot] using [`UnixStream::pair`].
+    pub fn unix_pair() -> std::io::Result<(Oneshot, UnixStream)> {
+        let (clt, srv) = UnixStream::pair()?;
+        Ok((clt.into(), srv))
     }
 }
 
@@ -60,8 +60,6 @@ impl From<std::os::unix::net::SocketAddr> for Client<std::os::unix::net::SocketA
 
 impl Invoke for Client<PathBuf> {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     #[instrument(level = "trace", skip(self, paths, params), fields(params = format!("{params:02x?}")))]
     async fn invoke<P>(
@@ -71,7 +69,7 @@ impl Invoke for Client<PathBuf> {
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Outgoing, Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -83,8 +81,6 @@ impl Invoke for Client<PathBuf> {
 
 impl Invoke for Client<&Path> {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     #[instrument(level = "trace", skip(self, paths, params), fields(params = format!("{params:02x?}")))]
     async fn invoke<P>(
@@ -94,7 +90,7 @@ impl Invoke for Client<&Path> {
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Outgoing, Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -106,8 +102,6 @@ impl Invoke for Client<&Path> {
 
 impl Invoke for Client<&std::os::unix::net::SocketAddr> {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     #[instrument(level = "trace", skip(self, paths, params), fields(params = format!("{params:02x?}")))]
     async fn invoke<P>(
@@ -117,7 +111,7 @@ impl Invoke for Client<&std::os::unix::net::SocketAddr> {
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Outgoing, Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -130,8 +124,6 @@ impl Invoke for Client<&std::os::unix::net::SocketAddr> {
 
 impl Invoke for Client<std::os::unix::net::SocketAddr> {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     #[instrument(level = "trace", skip(self, paths, params), fields(params = format!("{params:02x?}")))]
     async fn invoke<P>(
@@ -141,7 +133,7 @@ impl Invoke for Client<std::os::unix::net::SocketAddr> {
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Outgoing, Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -149,28 +141,5 @@ impl Invoke for Client<std::os::unix::net::SocketAddr> {
         let stream = UnixStream::from_std(stream)?;
         let (rx, tx) = stream.into_split();
         invoke(tx, rx, instance, func, params, paths).await
-    }
-}
-
-impl Accept for UnixListener {
-    type Context = SocketAddr;
-    type Outgoing = OwnedWriteHalf;
-    type Incoming = OwnedReadHalf;
-
-    async fn accept(&self) -> std::io::Result<(Self::Context, Self::Outgoing, Self::Incoming)> {
-        (&self).accept().await
-    }
-}
-
-impl Accept for &UnixListener {
-    type Context = SocketAddr;
-    type Outgoing = OwnedWriteHalf;
-    type Incoming = OwnedReadHalf;
-
-    #[instrument(level = "trace")]
-    async fn accept(&self) -> std::io::Result<(Self::Context, Self::Outgoing, Self::Incoming)> {
-        let (stream, addr) = UnixListener::accept(self).await?;
-        let (rx, tx) = stream.into_split();
-        Ok((addr, tx, rx))
     }
 }

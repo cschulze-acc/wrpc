@@ -1,6 +1,5 @@
 #![allow(clippy::type_complexity)]
 
-use core::iter;
 use core::ops::Bound;
 use core::pin::pin;
 use core::time::Duration;
@@ -8,30 +7,29 @@ use core::time::Duration;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context as _};
+use anyhow::{Context as _, anyhow, bail};
 use clap::Parser;
 use futures::StreamExt as _;
 use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
-use tracing::{error, info, instrument, warn, Instrument as _, Span};
+use tracing::{Instrument as _, Span, error, info, instrument, warn};
 use url::Url;
 use wasi_preview1_component_adapter_provider::{
     WASI_SNAPSHOT_PREVIEW1_ADAPTER_NAME, WASI_SNAPSHOT_PREVIEW1_COMMAND_ADAPTER,
     WASI_SNAPSHOT_PREVIEW1_REACTOR_ADAPTER,
 };
-use wasmtime::component::{types, Component, InstancePre, Linker, ResourceTable, ResourceType};
+use wasmtime::component::{Component, InstancePre, Linker, ResourceTable, ResourceType, types};
 use wasmtime::{Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
-use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wasmtime_wasi_http::WasiHttpCtx;
-use wrpc_runtime_wasmtime::{
-    collect_component_resource_exports, collect_component_resource_imports, link_item, rpc,
-    RemoteResource, ServeExt as _, SharedResourceTable, WrpcCtxView, WrpcView,
-};
+use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 use wrpc_transport::{Invoke, Serve};
+use wrpc_wasmtime::{
+    RemoteResource, ServeExt as _, SharedResourceTable, WrpcCtxView, WrpcView,
+    collect_component_resource_exports, collect_component_resource_imports, link_item, rpc,
+};
 
-mod nats;
 mod tcp;
 mod zenoh;
 
@@ -40,8 +38,6 @@ const DEFAULT_TIMEOUT: &str = "10s";
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 enum Command {
-    #[command(subcommand)]
-    Nats(nats::Command),
     #[command(subcommand)]
     Tcp(tcp::Command),
     #[command(subcommand)]
@@ -67,7 +63,7 @@ pub struct Ctx<C: Invoke> {
     pub wrpc: WrpcCtx<C>,
 }
 
-impl<C> wrpc_runtime_wasmtime::WrpcCtx<C> for WrpcCtx<C>
+impl<C> wrpc_wasmtime::WrpcCtx<C> for WrpcCtx<C>
 where
     C: Invoke,
     C::Context: Clone,
@@ -142,17 +138,15 @@ fn use_pooling_allocator_by_default() -> anyhow::Result<Option<bool>> {
 }
 
 fn is_0_2(version: &str, min_patch: u64) -> bool {
-    if let Ok(semver::Version {
-        major,
-        minor,
-        patch,
-        pre,
-        build,
-    }) = version.parse()
-    {
-        major == 0 && minor == 2 && patch >= min_patch && pre.is_empty() && build.is_empty()
-    } else {
-        false
+    match version.parse() {
+        Ok(semver::Version {
+            major,
+            minor,
+            patch,
+            pre,
+            build,
+        }) => major == 0 && minor == 2 && patch >= min_patch && pre.is_empty() && build.is_empty(),
+        _ => false,
     }
 }
 
@@ -170,8 +164,7 @@ where
     C: Invoke + Clone + 'static,
     C::Context: Clone + 'static,
 {
-    let mut opts = wasmtime_cli_flags::CommonOptions::try_parse_from(iter::empty::<&'static str>())
-        .context("failed to construct common Wasmtime options")?;
+    let mut opts = wasmtime_cli_flags::CommonOptions::new();
     let mut config = opts
         .config(use_pooling_allocator_by_default().unwrap_or(None))
         .map_err(anyhow::Error::from)
@@ -234,7 +227,7 @@ where
     wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut linker)
         .map_err(anyhow::Error::from)
         .context("failed to link `wasi:http`")?;
-    wrpc_runtime_wasmtime::rpc::add_to_linker(&mut linker)
+    wrpc_wasmtime::rpc::add_to_linker(&mut linker)
         .map_err(anyhow::Error::from)
         .context("failed to link `wrpc:rpc`")?;
 
@@ -248,7 +241,7 @@ where
             Bound::Included("wasi:io/error@0.2"),
             Bound::Excluded("wasi:io/error@0.3"),
         ))
-        .flat_map(|(_, instance)| instance.get("error"))
+        .filter_map(|(_, instance)| instance.get("error"))
         .copied()
         .collect::<Box<[_]>>();
     let io_pollable_tys = host_resources
@@ -256,7 +249,7 @@ where
             Bound::Included("wasi:io/poll@0.2"),
             Bound::Excluded("wasi:io/poll@0.3"),
         ))
-        .flat_map(|(_, instance)| instance.get("pollable"))
+        .filter_map(|(_, instance)| instance.get("pollable"))
         .copied()
         .collect::<Box<[_]>>();
     let io_input_stream_tys = host_resources
@@ -264,7 +257,7 @@ where
             Bound::Included("wasi:io/streams@0.2"),
             Bound::Excluded("wasi:io/streams@0.3"),
         ))
-        .flat_map(|(_, instance)| instance.get("input-stream"))
+        .filter_map(|(_, instance)| instance.get("input-stream"))
         .copied()
         .collect::<Box<[_]>>();
     let io_output_stream_tys = host_resources
@@ -272,7 +265,7 @@ where
             Bound::Included("wasi:io/streams@0.2"),
             Bound::Excluded("wasi:io/streams@0.3"),
         ))
-        .flat_map(|(_, instance)| instance.get("output-stream"))
+        .filter_map(|(_, instance)| instance.get("output-stream"))
         .copied()
         .collect::<Box<[_]>>();
     let rpc_err_ty = host_resources
@@ -310,7 +303,7 @@ where
         .collect::<HashMap<_, _>>();
     let host_resources = Arc::from(host_resources);
     let guest_resources = Arc::from(guest_resources);
-    for (name, item) in ty.imports(&engine) {
+    for (name, types::ComponentExtern { ty: item, .. }) in ty.imports(&engine) {
         // Avoid polyfilling instances, for which static bindings are linked
         match name.split_once('/').map(|(pkg, suffix)| {
             suffix
@@ -451,13 +444,12 @@ where
         .context("failed to instantiate component")?;
     let engine = store.engine().clone();
     let io_stream_resources: Arc<[ResourceType]> =
-        wrpc_runtime_wasmtime::paths::wasi_io_stream_resources(
-            &engine,
-            &pre.component().component_type(),
-        )
-        .into();
+        wrpc_wasmtime::paths::wasi_io_stream_resources(&engine, &pre.component().component_type())
+            .into();
     let store = Arc::new(Mutex::new(store));
-    for (name, ty) in pre.component().component_type().exports(&engine) {
+    for (name, types::ComponentExtern { ty, .. }) in
+        pre.component().component_type().exports(&engine)
+    {
         match (name, ty) {
             (name, types::ComponentItem::ComponentFunc(ty)) => {
                 info!(?name, "serving root function");
@@ -480,10 +472,13 @@ where
                             match invocation {
                                 Ok((_, fut)) => {
                                     info!("serving root function invocation");
-                                    if let Err(err) = fut.await {
-                                        warn!(?err, "failed to serve root function invocation");
-                                    } else {
-                                        info!("successfully served root function invocation");
+                                    match fut.await {
+                                        Err(err) => {
+                                            warn!(?err, "failed to serve root function invocation");
+                                        }
+                                        _ => {
+                                            info!("successfully served root function invocation");
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -505,7 +500,7 @@ where
                 warn!(name, "serving root component exports not supported yet");
             }
             (instance_name, types::ComponentItem::ComponentInstance(ty)) => {
-                for (name, ty) in ty.exports(&engine) {
+                for (name, types::ComponentExtern { ty, .. }) in ty.exports(&engine) {
                     match ty {
                         types::ComponentItem::ComponentFunc(ty) => {
                             info!(?name, "serving instance function");
@@ -529,17 +524,17 @@ where
                                 while let Some(invocation) = invocations.next().await {
                                     match invocation {
                                         Ok((_, fut)) => {
-                                            info!(?name_copy, "serving instance function invocation");
-                                            if let Err(err) = fut.await {
+                                            info!("serving instance function invocation");
+                                            match fut.await { Err(err) => {
                                                 warn!(
                                                     ?err,
                                                     "failed to serve instance function invocation"
                                                 );
-                                            } else {
+                                            } _ => {
                                                 info!(
                                                     ?name_copy, "successfully served instance function invocation"
                                                 );
-                                            }
+                                            }}
                                         }
                                         Err(err) => {
                                             error!(
@@ -604,7 +599,9 @@ where
     S: Serve,
 {
     let span = Span::current();
-    for (name, ty) in pre.component().component_type().exports(engine) {
+    for (name, types::ComponentExtern { ty, .. }) in
+        pre.component().component_type().exports(engine)
+    {
         match (name, ty) {
             (name, types::ComponentItem::ComponentFunc(ty)) => {
                 let clt = clt.clone();
@@ -630,10 +627,13 @@ where
                             match invocation {
                                 Ok((_, fut)) => {
                                     info!("serving root function invocation");
-                                    if let Err(err) = fut.await {
-                                        warn!(?err, "failed to serve root function invocation");
-                                    } else {
-                                        info!("successfully served root function invocation");
+                                    match fut.await {
+                                        Err(err) => {
+                                            warn!(?err, "failed to serve root function invocation");
+                                        }
+                                        _ => {
+                                            info!("successfully served root function invocation");
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -655,7 +655,7 @@ where
                 warn!(name, "serving root component exports not supported yet");
             }
             (instance_name, types::ComponentItem::ComponentInstance(ty)) => {
-                for (name, ty) in ty.exports(engine) {
+                for (name, types::ComponentExtern { ty, .. }) in ty.exports(engine) {
                     match ty {
                         types::ComponentItem::ComponentFunc(ty) => {
                             let clt = clt.clone();
@@ -687,16 +687,16 @@ where
                                     match invocation {
                                         Ok((_, fut)) => {
                                             info!("serving instance function invocation");
-                                            if let Err(err) = fut.await {
+                                            match fut.await { Err(err) => {
                                                 warn!(
                                                     ?err,
                                                     "failed to serve instance function invocation"
                                                 );
-                                            } else {
+                                            } _ => {
                                                 info!(
                                                     "successfully served instance function invocation: "
                                                 );
-                                            }
+                                            }}
                                         }
                                         Err(err) => {
                                             error!(
@@ -794,7 +794,6 @@ where
 pub async fn run() -> anyhow::Result<()> {
     wrpc_cli::tracing::init();
     match Command::parse() {
-        Command::Nats(args) => nats::run(args).await,
         Command::Tcp(args) => tcp::run(args).await,
         Command::Zenoh(args) => zenoh::run(args).await,
     }

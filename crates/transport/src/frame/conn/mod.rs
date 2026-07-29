@@ -1,11 +1,11 @@
+use core::fmt::{Debug, Display};
 use core::future::Future;
 use core::mem;
 use core::pin::Pin;
-use core::task::{ready, Context, Poll};
+use core::task::{Context, Poll, ready};
 
 use std::sync::Arc;
 
-use anyhow::ensure;
 use bytes::{Buf as _, BufMut as _, Bytes, BytesMut};
 use futures::Sink as _;
 use pin_project_lite::pin_project;
@@ -16,18 +16,77 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::codec::Encoder;
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
-use tracing::{debug, error, instrument, trace, Instrument as _, Span};
-use wasm_tokio::{AsyncReadLeb128 as _, Leb128Encoder};
+use tracing::{Instrument as _, Span, debug, error, instrument, trace};
+use wasm_tokio::{AsyncReadCore as _, AsyncReadLeb128 as _, Leb128Encoder};
 
-use crate::Index;
-
-mod accept;
 mod client;
 mod server;
 
-pub use accept::*;
 pub use client::*;
 pub use server::*;
+
+/// Error returned by [`Header::read`]
+pub enum HeaderReadError {
+    /// I/O error
+    IO(std::io::Error),
+    /// Protocol version is not supported
+    UnsupportedVersion(u8),
+}
+
+impl Debug for HeaderReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IO(err) => Debug::fmt(err, f),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported version byte: {v}"),
+        }
+    }
+}
+
+impl Display for HeaderReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IO(err) => Display::fmt(err, f),
+            Self::UnsupportedVersion(v) => write!(f, "unsupported version byte: {v}"),
+        }
+    }
+}
+
+impl core::error::Error for HeaderReadError {}
+
+/// wRPC invocation header
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Header {
+    /// Instance name of the function being called
+    pub instance: String,
+
+    /// Name of the function being called
+    pub name: String,
+}
+
+impl Header {
+    /// Reads the wRPC header from a byte stream
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if reading the header fails
+    #[instrument(level = "trace", skip_all, ret(level = "trace"))]
+    pub async fn read(mut rx: impl AsyncRead + Unpin) -> Result<Self, HeaderReadError> {
+        let mut instance = String::default();
+        let mut name = String::default();
+        match rx.read_u8().await.map_err(HeaderReadError::IO)? {
+            0x00 => {
+                rx.read_core_name(&mut instance)
+                    .await
+                    .map_err(HeaderReadError::IO)?;
+                rx.read_core_name(&mut name)
+                    .await
+                    .map_err(HeaderReadError::IO)?;
+            }
+            v => return Err(HeaderReadError::UnsupportedVersion(v)),
+        }
+        Ok(Self { instance, name })
+    }
+}
 
 /// Index trie containing async stream subscriptions
 #[derive(Debug, Default)]
@@ -150,7 +209,7 @@ impl IndexTrie {
         };
         match self {
             Self::Empty | Self::Leaf { .. } | Self::WildcardNode { .. } => None,
-            Self::IndexNode { ref mut nested, .. } => nested
+            Self::IndexNode { nested, .. } => nested
                 .get_mut(*i)
                 .and_then(|nested| nested.as_mut().and_then(|nested| nested.take_rx(path))),
             // TODO: Demux the subscription
@@ -172,7 +231,7 @@ impl IndexTrie {
         };
         match self {
             Self::Empty | Self::Leaf { .. } | Self::WildcardNode { .. } => None,
-            Self::IndexNode { ref mut nested, .. } => {
+            Self::IndexNode { nested, .. } => {
                 let nested = nested.get_mut(*i)?;
                 let nested = nested.as_mut()?;
                 nested.get_tx(path)
@@ -191,17 +250,13 @@ impl IndexTrie {
             Self::Leaf { tx, .. } => {
                 mem::take(tx);
             }
-            Self::IndexNode {
-                tx, ref mut nested, ..
-            } => {
+            Self::IndexNode { tx, nested, .. } => {
                 mem::take(tx);
                 for nested in nested.iter_mut().flatten() {
                     nested.close_tx();
                 }
             }
-            Self::WildcardNode {
-                tx, ref mut nested, ..
-            } => {
+            Self::WildcardNode { tx, nested, .. } => {
                 mem::take(tx);
                 if let Some(nested) = nested {
                     nested.close_tx();
@@ -246,11 +301,7 @@ impl IndexTrie {
                 }
                 true
             }
-            Self::IndexNode {
-                ref mut tx,
-                ref mut rx,
-                ref mut nested,
-            } => match (&tx, &rx, path) {
+            Self::IndexNode { tx, rx, nested } => match (&tx, &rx, path) {
                 (None, None, []) => {
                     *tx = Some(sender);
                     *rx = receiver;
@@ -271,11 +322,7 @@ impl IndexTrie {
                 }
                 _ => false,
             },
-            Self::WildcardNode {
-                ref mut tx,
-                ref mut rx,
-                ref mut nested,
-            } => match (&tx, &rx, path) {
+            Self::WildcardNode { tx, rx, nested } => match (&tx, &rx, path) {
                 (None, None, []) => {
                     *tx = Some(sender);
                     *rx = receiver;
@@ -307,10 +354,55 @@ pin_project! {
     }
 }
 
-impl Index<Self> for Incoming {
+impl Incoming {
+    /// Creates a new [Incoming] given an [`AsyncRead`], [`ConnHandler`] and a set of async paths.
+    /// `on_ingress` will be called once data ingress is complete.
+    pub fn new<T, P, Fut>(
+        mut rx: T,
+        paths: impl IntoIterator<Item = P>,
+        on_ingress: impl FnOnce(T, std::io::Result<()>) -> Fut + Send + 'static,
+    ) -> Self
+    where
+        T: AsyncRead + Unpin + Send + 'static,
+        P: AsRef<[Option<usize>]>,
+        Fut: Future<Output = ()> + Send,
+    {
+        let index = Arc::new(std::sync::Mutex::new(paths.into_iter().collect()));
+        let (rx_tx, rx_rx) = mpsc::channel(128);
+        let mut rx_io = JoinSet::new();
+        let span = Span::current();
+        rx_io.spawn({
+            let index = Arc::clone(&index);
+            async move {
+                let res = ingress(&mut rx, &index, rx_tx).await;
+                on_ingress(rx, res).await;
+                let Ok(mut index) = index.lock() else {
+                    error!("failed to lock index trie");
+                    return;
+                };
+                trace!("shutting down index trie");
+                index.close_tx();
+            }
+            .instrument(span.clone())
+        });
+        Self {
+            rx: Some(StreamReader::new(ReceiverStream::new(rx_rx))),
+            path: Arc::from([]),
+            index: Arc::clone(&index),
+            io: Arc::new(rx_io),
+        }
+    }
+
+    /// Index the incoming stream using a structural `path`, returning a handle to the
+    /// multiplexed sub-stream addressed by it.
     #[instrument(level = "trace", skip(self), fields(path = ?self.path))]
-    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
-        ensure!(!path.is_empty());
+    pub fn index(&self, path: &[usize]) -> std::io::Result<Self> {
+        if path.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path cannot be empty",
+            ));
+        }
         let path = if self.path.is_empty() {
             Arc::from(path)
         } else {
@@ -370,10 +462,42 @@ pin_project! {
     }
 }
 
-impl Index<Self> for Outgoing {
+impl Outgoing {
+    /// Creates a new [Outgoing] given an [`AsyncWrite`].
+    pub fn new<T, Fut>(
+        mut tx: T,
+        on_egress: impl FnOnce(T, std::io::Result<()>) -> Fut + Send + 'static,
+    ) -> Self
+    where
+        T: AsyncWrite + Unpin + Send + 'static,
+        Fut: Future<Output = ()> + Send,
+    {
+        let span = Span::current();
+        let (tx_tx, tx_rx) = mpsc::channel(128);
+        tokio::spawn(
+            async {
+                let res = egress(&mut tx, tx_rx).await;
+                on_egress(tx, res).await;
+            }
+            .instrument(span.clone()),
+        );
+        Self {
+            tx: PollSender::new(tx_tx),
+            path: Arc::from([]),
+            path_buf: Bytes::from_static(&[0]),
+        }
+    }
+
+    /// Index the outgoing stream using a structural `path`, returning a handle that writes
+    /// to the multiplexed sub-stream addressed by it.
     #[instrument(level = "trace", skip(self), fields(path = ?self.path))]
-    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
-        ensure!(!path.is_empty());
+    pub fn index(&self, path: &[usize]) -> std::io::Result<Self> {
+        if path.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path cannot be empty",
+            ));
+        }
         let path: Arc<[usize]> = if self.path.is_empty() {
             Arc::from(path)
         } else {
@@ -502,6 +626,7 @@ async fn egress(
         let mut frame = path.chain(&mut buf).chain(data);
         trace!(?frame, "writing egress frame");
         tx.write_all_buf(&mut frame).await?;
+        tx.flush().await?;
     }
     trace!("shutting down outgoing stream");
     tx.shutdown().await
@@ -509,7 +634,7 @@ async fn egress(
 
 /// Connection handler defines the connection I/O behavior.
 /// It is mostly useful for transports that may require additional clean up not already covered
-/// by [AsyncWrite::shutdown], for example.
+/// by [`AsyncWrite::shutdown`], for example.
 /// This API is experimental and may change in backwards-incompatible ways in the future.
 pub trait ConnHandler<Rx, Tx> {
     /// Handle ingress completion
@@ -536,60 +661,3 @@ pub trait ConnHandler<Rx, Tx> {
 }
 
 impl<Rx, Tx> ConnHandler<Rx, Tx> for () {}
-
-/// Peer connection
-pub(crate) struct Conn {
-    rx: Incoming,
-    tx: Outgoing,
-}
-
-impl Conn {
-    /// Creates a new [Conn] given an [AsyncRead], [ConnHandler] and a set of async paths
-    fn new<H, Rx, Tx, P>(mut rx: Rx, mut tx: Tx, paths: impl IntoIterator<Item = P>) -> Self
-    where
-        Rx: AsyncRead + Unpin + Send + 'static,
-        Tx: AsyncWrite + Unpin + Send + 'static,
-        H: ConnHandler<Rx, Tx>,
-        P: AsRef<[Option<usize>]>,
-    {
-        let index = Arc::new(std::sync::Mutex::new(paths.into_iter().collect()));
-        let (rx_tx, rx_rx) = mpsc::channel(128);
-        let mut rx_io = JoinSet::new();
-        let span = Span::current();
-        rx_io.spawn({
-            let index = Arc::clone(&index);
-            async move {
-                let res = ingress(&mut rx, &index, rx_tx).await;
-                H::on_ingress(rx, res).await;
-                let Ok(mut index) = index.lock() else {
-                    error!("failed to lock index trie");
-                    return;
-                };
-                trace!("shutting down index trie");
-                index.close_tx();
-            }
-            .instrument(span.clone())
-        });
-        let (tx_tx, tx_rx) = mpsc::channel(128);
-        tokio::spawn(
-            async {
-                let res = egress(&mut tx, tx_rx).await;
-                H::on_egress(tx, res).await;
-            }
-            .instrument(span.clone()),
-        );
-        Conn {
-            tx: Outgoing {
-                tx: PollSender::new(tx_tx),
-                path: Arc::from([]),
-                path_buf: Bytes::from_static(&[0]),
-            },
-            rx: Incoming {
-                rx: Some(StreamReader::new(ReceiverStream::new(rx_rx))),
-                path: Arc::from([]),
-                index: Arc::clone(&index),
-                io: Arc::new(rx_io),
-            },
-        }
-    }
-}

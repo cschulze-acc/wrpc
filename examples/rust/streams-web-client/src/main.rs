@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use bytes::Bytes;
 use clap::Parser;
-use futures::{stream, StreamExt as _};
+use futures::{StreamExt as _, stream};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::version::TLS13;
@@ -24,7 +24,7 @@ mod bindings {
     });
 }
 
-use bindings::wrpc_examples::streams::handler::{echo, Req};
+use bindings::wrpc_examples::streams::handler::{Req, echo};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(&addr)
         .await
         .context("failed to connect to server")?;
-    let wrpc = wrpc_transport_web::Client::from(session);
+    let wrpc = wrpc_webtransport::Client::from(session);
 
     let numbers = Box::pin(
         stream::iter(1..)
@@ -114,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
             .map(Bytes::from),
     );
 
-    let (mut numbers, mut bytes, io) = echo(&wrpc, (), Req { numbers, bytes })
+    let ((mut numbers, mut bytes), io) = echo(&wrpc, (), Req { numbers, bytes })
         .await
         .context("failed to invoke `wrpc-examples:streams/handler.echo`")?;
     try_join!(

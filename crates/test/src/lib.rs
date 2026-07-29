@@ -1,28 +1,199 @@
+use core::future::Future;
 use core::net::Ipv6Addr;
+use core::pin::pin;
 
 use std::process::ExitStatus;
+use std::sync::Arc;
 
 use anyhow::Context;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use futures::TryStreamExt as _;
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpListener;
 use tokio::process::Command;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use tokio::{select, spawn};
+use tokio::{select, spawn, try_join};
+use tracing::info;
+use wrpc_transport::{Invoke, Serve};
 
-pub async fn free_port() -> anyhow::Result<u16> {
+async fn tcp_bind() -> anyhow::Result<TcpListener> {
     TcpListener::bind((Ipv6Addr::LOCALHOST, 0))
         .await
-        .context("failed to start TCP listener")?
-        .local_addr()
+        .context("failed to start TCP listener")
+}
+
+pub async fn free_port() -> anyhow::Result<u16> {
+    let sock = tcp_bind().await?;
+    sock.local_addr()
         .context("failed to query listener local address")
         .map(|v| v.port())
+}
+
+/// A common single-invocation test used by different transport implementations.
+///
+/// The server is set up via the [`Serve`] implementation `srv`. The `accept`
+/// future is run concurrently and is responsible for feeding established
+/// connections into `srv` (e.g. accepting a bidirectional stream); transports
+/// that subscribe internally can pass a future that resolves immediately.
+pub async fn assert_single_invocation<C, S>(
+    cx: C::Context,
+    clt: &C,
+    srv: &S,
+    accept: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<S::Context>
+where
+    C: Invoke,
+    S: Serve,
+{
+    let invocations = srv
+        .serve("foo", "bar", Arc::from([Box::from([Some(42), Some(0)])]))
+        .await
+        .context("failed to serve `foo.bar`")?;
+    let mut invocations = pin!(invocations);
+    let ((), cx) = try_join!(
+        async {
+            let (mut outgoing, mut incoming) = clt
+                .invoke(cx, "foo", "bar", "test".into(), &[&[Some(0), Some(42)]])
+                .await
+                .context("failed to invoke `foo.bar`")?;
+            let mut nested_tx = outgoing.index(&[42, 0]).context("failed to index `42.0`")?;
+            let mut nested_rx = incoming.index(&[0, 42]).context("failed to index `0.42`")?;
+            try_join!(
+                async {
+                    info!("reading `foo`");
+                    let mut buf = vec![];
+                    let n = incoming
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("failed to read `foo`")?;
+                    assert_eq!(n, 3);
+                    assert_eq!(buf, b"foo");
+                    info!("read `foo`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("writing `bar`");
+                    outgoing
+                        .write_all(b"bar")
+                        .await
+                        .context("failed to write `bar`")?;
+                    outgoing
+                        .shutdown()
+                        .await
+                        .context("failed to shutdown stream")?;
+                    drop(outgoing);
+                    info!("wrote `bar`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("writing `client->server`");
+                    nested_tx
+                        .write_all(b"client->server")
+                        .await
+                        .context("failed to write `client->server`")?;
+                    nested_tx
+                        .shutdown()
+                        .await
+                        .context("failed to shutdown stream")?;
+                    drop(nested_tx);
+                    info!("wrote `client->server`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("reading `server->client`");
+                    let mut buf = vec![];
+                    nested_rx
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("failed to read `server->client`")?;
+                    assert_eq!(buf, b"server->client");
+                    info!("read `server->client`");
+                    anyhow::Ok(())
+                },
+            )?;
+            anyhow::Ok(())
+        },
+        async {
+            let ((), (cx, mut outgoing, mut incoming)) = try_join!(accept, async {
+                invocations
+                    .try_next()
+                    .await
+                    .context("failed to accept invocation")?
+                    .context("invocation stream unexpectedly finished")
+            })?;
+            let mut nested_tx = outgoing.index(&[0, 42]).context("failed to index `0.42`")?;
+            let mut nested_rx = incoming.index(&[42, 0]).context("failed to index `42.0`")?;
+            try_join!(
+                async {
+                    info!("reading `test`");
+                    let mut buf = vec![0; 4];
+                    incoming
+                        .read_exact(&mut buf)
+                        .await
+                        .context("failed to read `test`")?;
+                    assert_eq!(buf, b"test");
+                    info!("read `test`");
+
+                    info!("reading `bar`");
+                    let mut buf = vec![];
+                    let n = incoming
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("failed to read `bar`")?;
+                    assert_eq!(n, 3);
+                    assert_eq!(buf, b"bar");
+                    info!("read `bar`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("writing `foo`");
+                    outgoing
+                        .write_all(b"foo")
+                        .await
+                        .context("failed to write `foo`")?;
+                    outgoing
+                        .shutdown()
+                        .await
+                        .context("failed to shutdown stream")?;
+                    drop(outgoing);
+                    info!("wrote `foo`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("writing `server->client`");
+                    nested_tx
+                        .write_all(b"server->client")
+                        .await
+                        .context("failed to write `server->client`")?;
+                    nested_tx
+                        .shutdown()
+                        .await
+                        .context("failed to shutdown stream")?;
+                    drop(nested_tx);
+                    info!("wrote `server->client`");
+                    anyhow::Ok(())
+                },
+                async {
+                    info!("reading `client->server`");
+                    let mut buf = vec![];
+                    let n = nested_rx
+                        .read_to_end(&mut buf)
+                        .await
+                        .context("failed to read `client->server`")?;
+                    assert_eq!(n, 14);
+                    assert_eq!(buf, b"client->server");
+                    info!("read `client->server`");
+                    anyhow::Ok(())
+                },
+            )?;
+            anyhow::Ok(cx)
+        },
+    )?;
+    Ok(cx)
 }
 
 pub async fn spawn_server(
@@ -85,41 +256,6 @@ pub fn cert_pair() -> anyhow::Result<(rustls::ServerConfig, rustls::ClientConfig
     Ok((srv_cnf, clt_cnf))
 }
 
-#[cfg(feature = "nats")]
-pub async fn start_nats() -> anyhow::Result<(
-    u16,
-    async_nats::Client,
-    JoinHandle<anyhow::Result<ExitStatus>>,
-    oneshot::Sender<()>,
-)> {
-    // Check if nats-server is available
-    let nats_server_check = Command::new("nats-server").arg("--version").output().await;
-    if let Err(e) = nats_server_check {
-        let error_msg = if e.kind() == std::io::ErrorKind::NotFound {
-            "nats-server is not installed or not in PATH"
-        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-            "nats-server is not executable or permission denied"
-        } else {
-            "failed to execute nats-server"
-        };
-        anyhow::bail!(
-            "{error_msg}. Please install nats-server >= 2.10.20. \
-            See https://docs.nats.io/running-a-nats-service/introduction/installation for installation instructions. \
-            Original error: {e}"
-        );
-    }
-
-    let port = free_port().await?;
-    let (server, stop_tx) =
-        spawn_server(Command::new("nats-server").args(["-T=false", "-p", &port.to_string()]))
-            .await
-            .context("failed to start NATS.io server")?;
-
-    let client = wrpc_cli::nats::connect(format!("nats://localhost:{port}"))
-        .await
-        .context("failed to connect to NATS.io server")?;
-    Ok((port, client, server, stop_tx))
-}
 
 #[cfg(feature = "zenoh-transport")]
 pub async fn start_zenoh() -> anyhow::Result<(
@@ -128,11 +264,11 @@ pub async fn start_zenoh() -> anyhow::Result<(
     JoinHandle<anyhow::Result<ExitStatus>>,
     oneshot::Sender<()>,
 )> {
-    // Check if nats-server is available
+    // Check if zenoh-server is available
 
     use zenoh::Config;
-    let nats_server_check = Command::new("zenohd").arg("--version").output().await;
-    if let Err(e) = nats_server_check {
+    let zenoh_server_check = Command::new("zenohd").arg("--version").output().await;
+    if let Err(e) = zenoh_server_check {
         let error_msg = if e.kind() == std::io::ErrorKind::NotFound {
             "zenohd is not installed or not in PATH"
         } else if e.kind() == std::io::ErrorKind::PermissionDenied {
@@ -275,32 +411,13 @@ where
     Ok(res)
 }
 
-#[cfg(feature = "nats")]
-pub async fn with_nats<T, Fut>(f: impl FnOnce(u16, async_nats::Client) -> Fut) -> anyhow::Result<T>
-where
-    Fut: core::future::Future<Output = anyhow::Result<T>>,
-{
-    let (port, nats_client, nats_server, stop_tx) = start_nats()
-        .await
-        .context("failed to start NATS.io server")?;
-    let res = f(port, nats_client).await.context("closure failed")?;
-    stop_tx.send(()).expect("failed to stop NATS.io server");
-    nats_server
-        .await
-        .context("failed to await NATS.io server stop")?
-        .context("NATS.io server failed to stop")?;
-    Ok(res)
-}
-
 #[cfg(feature = "quic")]
 pub async fn with_quic_endpoints<T, Fut>(
     f: impl FnOnce(core::net::SocketAddr, quinn::Endpoint, quinn::Endpoint) -> Fut,
 ) -> anyhow::Result<T>
 where
-    Fut: core::future::Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = anyhow::Result<T>>,
 {
-    use std::sync::Arc;
-
     use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use quinn::{ClientConfig, ServerConfig};
 
@@ -324,7 +441,7 @@ where
     .context("failed to create server endpoint")?;
     let srv_addr = srv_ep
         .local_addr()
-        .context("failed to query server address")?;
+        .context("failed to query listener local address")?;
 
     f(srv_addr, clt_ep, srv_ep).await.context("closure failed")
 }
@@ -334,7 +451,7 @@ pub async fn with_quic<T, Fut>(
     f: impl FnOnce(quinn::Connection, quinn::Connection) -> Fut,
 ) -> anyhow::Result<T>
 where
-    Fut: core::future::Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = anyhow::Result<T>>,
 {
     with_quic_endpoints(|addr, clt, srv| async move {
         let (clt, srv) = tokio::try_join!(
@@ -354,12 +471,12 @@ where
     .await
 }
 
-#[cfg(feature = "web-transport")]
-pub async fn with_web_transport<T, Fut>(
+#[cfg(feature = "webtransport")]
+pub async fn with_webtransport<T, Fut>(
     f: impl FnOnce(wtransport::Connection, wtransport::Connection) -> Fut,
 ) -> anyhow::Result<T>
 where
-    Fut: core::future::Future<Output = anyhow::Result<T>>,
+    Fut: Future<Output = anyhow::Result<T>>,
 {
     use wtransport::Endpoint;
 
@@ -379,7 +496,9 @@ where
             .build(),
     )
     .context("failed to create client endpoint")?;
-    let addr = srv.local_addr().context("failed to query server address")?;
+    let addr = srv
+        .local_addr()
+        .context("failed to query listener local address")?;
     let (clt, srv) = tokio::try_join!(
         async move {
             clt.connect(format!("https://localhost:{}", addr.port()))
@@ -398,4 +517,110 @@ where
         }
     )?;
     f(clt, srv).await.context("closure failed")
+}
+
+#[cfg(feature = "http")]
+pub async fn with_http2<S, B, T, Fut>(
+    svc: S,
+    f: impl FnOnce(http::request::Parts, hyper::client::conn::http2::SendRequest<B>) -> Fut,
+) -> anyhow::Result<T>
+where
+    S: hyper::service::HttpService<hyper::body::Incoming> + Send,
+    S::ResBody: Send + 'static,
+    S::Future: Send + 'static,
+    <S::ResBody as hyper::body::Body>::Data: Send + 'static,
+    <S::ResBody as hyper::body::Body>::Error: Send + Sync + core::error::Error + 'static,
+    B: hyper::body::Body + Send + Unpin + 'static,
+    B::Data: Send + Sync + 'static,
+    B::Error: Send + Sync + core::error::Error + 'static,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    use hyper_util::rt::tokio::WithHyperIo;
+    let exe = hyper_util::rt::TokioExecutor::new();
+
+    let lis = tcp_bind().await?;
+    let addr = lis
+        .local_addr()
+        .context("failed to query listener local address")?;
+
+    let ((sender, clt), (srv, addr)) = try_join!(
+        async {
+            let conn = tokio::net::TcpStream::connect(addr)
+                .await
+                .context("failed to connect to server")?;
+            hyper::client::conn::http2::handshake(exe.clone(), WithHyperIo::new(conn))
+                .await
+                .context("failed to establish HTTP/2 connection")
+        },
+        async { lis.accept().await.context("failed to accept connection") }
+    )?;
+    assert!(addr.ip().is_loopback());
+
+    let (parts, ()) = http::Request::new(()).into_parts();
+    let (res, (), ()) = try_join!(
+        async { f(parts, sender).await.context("closure failed") },
+        async {
+            hyper::server::conn::http2::Builder::new(exe)
+                .serve_connection(WithHyperIo::new(srv), svc)
+                .await
+                .context("failed to serve connection")
+        },
+        async { clt.await.context("client connection failed") }
+    )?;
+    Ok(res)
+}
+
+#[cfg(feature = "http")]
+pub async fn with_http_pooling<B, T, Fut>(
+    f: impl FnOnce(
+        http::request::Parts,
+        hyper_util::client::legacy::Client<
+            hyper_util::client::legacy::connect::HttpConnector<
+                hyper_util::client::legacy::connect::dns::GaiResolver,
+            >,
+            B,
+        >,
+        TcpListener,
+    ) -> Fut,
+) -> anyhow::Result<T>
+where
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send + Sync + 'static,
+    B::Error: Send + Sync + core::error::Error + 'static,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    let lis = tcp_bind().await?;
+    let addr = lis
+        .local_addr()
+        .context("failed to query listener local address")?;
+    let clt = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build_http();
+    let (mut parts, ()) = http::Request::new(()).into_parts();
+    parts.uri = format!("http://{addr}").parse().unwrap();
+    f(parts, clt, lis).await.context("closure failed")
+}
+
+#[cfg(feature = "websockets")]
+pub async fn with_websockets<T, Fut>(
+    f: impl FnOnce(
+        tokio_websockets::ClientBuilder<'static>,
+        tokio_websockets::ServerBuilder,
+        TcpListener,
+    ) -> Fut,
+) -> anyhow::Result<T>
+where
+    Fut: core::future::Future<Output = anyhow::Result<T>>,
+{
+    use tokio_websockets::{ClientBuilder, ServerBuilder};
+
+    let lis = tcp_bind().await?;
+    let addr = lis
+        .local_addr()
+        .context("failed to query listener local address")?;
+    let clt = ClientBuilder::new()
+        .uri(&format!("ws://[::1]:{}", addr.port()))
+        .context("failed to set WebSocket URI")?;
+    f(clt, ServerBuilder::new(), lis)
+        .await
+        .context("closure failed")
 }

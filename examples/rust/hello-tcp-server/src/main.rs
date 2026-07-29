@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
-use futures::stream::select_all;
 use futures::StreamExt as _;
+use futures::stream::select_all;
 use tokio::task::JoinSet;
 use tokio::{select, signal};
 use tracing::{debug, error, info, warn};
@@ -50,8 +50,14 @@ async fn main() -> anyhow::Result<()> {
         let srv = Arc::clone(&srv);
         async move {
             loop {
-                if let Err(err) = srv.accept(&lis).await {
-                    error!(?err, "failed to accept TCP connection");
+                match lis.accept().await {
+                    Ok((stream, addr)) => {
+                        let (rx, tx) = stream.into_split();
+                        if let Err(err) = srv.accept(addr, tx, rx).await {
+                            error!(?err, "failed to serve TCP connection");
+                        }
+                    }
+                    Err(err) => error!(?err, "failed to accept TCP connection"),
                 }
             }
         }
@@ -77,11 +83,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(fut) => {
                         debug!(instance, name, "invocation accepted");
                         tasks.spawn(async move {
-                            if let Err(err) = fut.await {
+                            match fut.await { Err(err) => {
                                 warn!(?err, "failed to handle invocation");
-                            } else {
+                            } _ => {
                                 info!(instance, name, "invocation successfully handled");
-                            }
+                            }}
                         });
                     }
                     Err(err) => {
@@ -91,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(res) = tasks.join_next() => {
                 if let Err(err) = res {
-                    error!(?err, "failed to join task")
+                    error!(?err, "failed to join task");
                 }
             }
             res = &mut shutdown => {
@@ -99,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
                 // wait for all invocations to complete
                 while let Some(res) = tasks.join_next().await {
                     if let Err(err) = res {
-                        error!(?err, "failed to join task")
+                        error!(?err, "failed to join task");
                     }
                 }
                 return res.context("failed to listen for ^C")

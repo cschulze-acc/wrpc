@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use clap::Parser;
-use futures::stream::select_all;
 use futures::StreamExt as _;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use futures::stream::select_all;
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use tokio::task::JoinSet;
@@ -70,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("failed to create server endpoint")?;
 
-    let srv = Arc::new(wrpc_transport_web::Server::new());
+    let srv = Arc::new(wrpc_webtransport::Server::new());
     let invocations = bindings::serve(srv.as_ref(), Handler)
         .await
         .context("failed to serve `wrpc-examples.hello/handler.hello`")?;
@@ -88,9 +88,12 @@ async fn main() -> anyhow::Result<()> {
                     .accept()
                     .await
                     .context("failed to establish WebTransport connection")?;
-                let wrpc = wrpc_transport_web::Client::from(conn);
                 loop {
-                    srv.accept(&wrpc)
+                    let (tx, rx) = conn
+                        .accept_bi()
+                        .await
+                        .context("failed to accept wRPC connection")?;
+                    srv.accept((), tx, rx)
                         .await
                         .context("failed to accept wRPC connection")?;
                 }
@@ -115,11 +118,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(fut) => {
                         debug!(instance, name, "invocation accepted");
                         tasks.spawn(async move {
-                            if let Err(err) = fut.await {
+                            match fut.await { Err(err) => {
                                 warn!(?err, "failed to handle invocation");
-                            } else {
+                            } _ => {
                                 info!(instance, name, "invocation successfully handled");
-                            }
+                            }}
                         });
                     }
                     Err(err) => {
@@ -129,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(res) = tasks.join_next() => {
                 if let Err(err) = res {
-                    error!(?err, "failed to join task")
+                    error!(?err, "failed to join task");
                 }
             }
             res = &mut shutdown => {
@@ -137,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
                 // wait for all invocations to complete
                 while let Some(res) = tasks.join_next().await {
                     if let Err(err) = res {
-                        error!(?err, "failed to join task")
+                        error!(?err, "failed to join task");
                     }
                 }
                 return res.context("failed to listen for ^C")

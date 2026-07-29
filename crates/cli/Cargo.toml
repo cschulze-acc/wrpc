@@ -1,6 +1,6 @@
 [package]
 name = "wrpc-cli"
-version = "0.7.0"
+version = "0.8.0"
 description = "wRPC CLI utilities"
 
 authors.workspace = true
@@ -10,15 +10,7 @@ homepage.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-default = ["nats", "zenoh-transport"]
-nats = ["async-nats/ring", "dep:async-nats", "dep:tokio", "tokio/sync"]
-zenoh-transport = ["dep:zenoh", "dep:tokio", "tokio/sync"]
-
 [dependencies]
-anyhow = { workspace = true, features = ["std"] }
-async-nats = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = [
     "ansi",
     "env-filter",
@@ -28,3 +20,7 @@ tracing-subscriber = { workspace = true, features = [
 ] }
 zenoh = { workspace = true, optional = true, features = ["transport_tcp"] }
 serde_json = { workspace = true, default-features = false }
+
+[features]
+default = ["zenoh-transport"]
+zenoh-transport = ["dep:zenoh", "dep:tokio", "tokio/sync"]

@@ -1,24 +1,24 @@
 use crate::{
-    int_repr, to_rust_ident, to_upper_camel_case, FnSig, Identifier, InterfaceName, RustFlagsRepr,
-    RustWrpc,
+    FnSig, Identifier, InterfaceName, RustFlagsRepr, RustWrpc, TypeGeneration, full_wit_type_name,
+    int_repr, to_rust_ident, to_upper_camel_case,
 };
-use heck::{ToShoutySnakeCase, ToUpperCamelCase};
+use heck::{ToKebabCase, ToShoutySnakeCase, ToUpperCamelCase};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::mem;
 use wit_bindgen_core::wit_parser::{
-    Case, Docs, Enum, Field, Flags, Function, FunctionKind, Handle, Int, InterfaceId, Record,
-    Resolve, Result_, Stream, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, World,
+    Case, Docs, Enum, Field, Flags, Function, FunctionKind, Handle, Int, InterfaceId, Param,
+    Record, Resolve, Result_, Tuple, Type, TypeDefKind, TypeId, TypeOwner, Variant, World,
     WorldKey,
 };
-use wit_bindgen_core::{uwrite, uwriteln, Source, TypeInfo};
+use wit_bindgen_core::{Source, TypeInfo, dealias, uwrite, uwriteln};
 use wrpc_introspect::{async_paths_ty, async_paths_tyid, is_ty, rpc_func_name};
 
 pub struct InterfaceGenerator<'a> {
     pub src: Source,
     pub(super) identifier: Identifier<'a>,
     pub in_import: bool,
-    pub(super) gen: &'a mut RustWrpc,
+    pub(super) r#gen: &'a mut RustWrpc,
     pub resolve: &'a Resolve,
 }
 
@@ -45,15 +45,17 @@ impl InterfaceGenerator<'_> {
         }
 
         for func in funcs {
-            if self.gen.skip.contains(&func.name) {
+            if self.r#gen.skip.contains(&func.name) {
                 continue;
             }
 
             let resource = match func.kind {
-                FunctionKind::Freestanding => None,
+                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => None,
                 FunctionKind::Method(id)
                 | FunctionKind::Constructor(id)
-                | FunctionKind::Static(id) => Some(id),
+                | FunctionKind::Static(id)
+                | FunctionKind::AsyncMethod(id)
+                | FunctionKind::AsyncStatic(id) => Some(id),
             };
             funcs_to_export.push(func);
             let (_, methods) = traits.get_mut(&resource).unwrap();
@@ -68,21 +70,21 @@ impl InterfaceGenerator<'_> {
             sig.self_is_first_param = false;
 
             self.print_docs_and_params(func, &sig);
-            match func.results.len() {
+            match func.result.iter().len() {
                 0 => {
                     uwrite!(
                         self.src,
                         " -> impl ::core::future::Future<Output = {}::Result<()>> + ::core::marker::Send",
-                        self.gen.anyhow_path()
+                        self.r#gen.anyhow_path()
                     );
                 }
                 1 => {
                     uwrite!(
                         self.src,
                         " -> impl ::core::future::Future<Output = {}::Result<",
-                        self.gen.anyhow_path()
+                        self.r#gen.anyhow_path()
                     );
-                    let ty = func.results.iter_types().next().unwrap();
+                    let ty = func.result.iter().next().unwrap();
                     self.print_ty(ty, true, false);
                     self.push_str(">> + ::core::marker::Send");
                 }
@@ -90,9 +92,9 @@ impl InterfaceGenerator<'_> {
                     uwrite!(
                         self.src,
                         " -> impl ::core::future::Future<Output = {}::Result<(",
-                        self.gen.anyhow_path()
+                        self.r#gen.anyhow_path()
                     );
-                    for ty in func.results.iter_types() {
+                    for ty in func.result.iter() {
                         self.print_ty(ty, true, false);
                         self.push_str(", ");
                     }
@@ -141,9 +143,9 @@ impl InterfaceGenerator<'_> {
             self.src,
             r#"
 #[allow(clippy::manual_async_fn)]
-pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
+pub fn serve_interface<'a, T: {wrpc_transport}::Serve, H: Handler<T::Context> + {resource_traits} ::core::marker::Send + ::core::marker::Sync + ::core::clone::Clone + 'static>(
     wrpc: &'a T,
-    handler: impl Handler<T::Context> + {resource_traits} ::core::marker::Send + ::core::marker::Sync + ::core::clone::Clone + 'static,
+    handler: H,
 ) -> impl ::core::future::Future<
         Output = {anyhow}::Result<
             [
@@ -169,23 +171,23 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 {n}
             ] 
         >
-    > + ::core::marker::Send + {wrpc_transport}::Captures<'a> {{
+    > + ::core::marker::Send + use<'a, T, H> {{
     async move {{
         let ("#,
             resource_traits = trait_names.join(""),
-            anyhow = self.gen.anyhow_path(),
-            futures = self.gen.futures_path(),
-            wrpc_transport = self.gen.wrpc_transport_path()
+            anyhow = self.r#gen.anyhow_path(),
+            futures = self.r#gen.futures_path(),
+            wrpc_transport = self.r#gen.wrpc_transport_path()
         );
         for Function { name, kind, .. } in &funcs_to_export {
             uwriteln!(
                 self.src,
                 "{}_{},",
                 match kind {
-                    FunctionKind::Freestanding => "f",
-                    FunctionKind::Method(_) => "m",
+                    FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => "f",
+                    FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => "m",
                     FunctionKind::Constructor(_) => "c",
-                    FunctionKind::Static(_) => "s",
+                    FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => "s",
                 },
                 to_rust_ident(name)
             );
@@ -193,7 +195,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         uwrite!(
             self.src,
             ") = {tokio}::try_join!(",
-            tokio = self.gen.tokio_path()
+            tokio = self.r#gen.tokio_path()
         );
         let instance = match identifier {
             Identifier::Interface(id, name) => {
@@ -226,8 +228,8 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         for func in &funcs_to_export {
             let paths = func.params.iter().enumerate().fold(
                 BTreeSet::default(),
-                |mut paths, (i, (_, ty))| {
-                    let (nested, fut) = async_paths_ty(self.resolve, ty);
+                |mut paths, (i, param)| {
+                    let (nested, fut) = async_paths_ty(self.resolve, &param.ty);
                     for path in nested {
                         let mut s = String::with_capacity(3 + path.len() * 6);
                         s.push_str(&format!("[Some({i})"));
@@ -257,8 +259,8 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     "{}",
                     ::std::sync::Arc::from("#,
                 rpc_func_name(func),
-                anyhow = self.gen.anyhow_path(),
-                wrpc_transport = self.gen.wrpc_transport_path(),
+                anyhow = self.r#gen.anyhow_path(),
+                wrpc_transport = self.r#gen.wrpc_transport_path(),
             );
             if paths.is_empty() {
                 self.src.push_str(
@@ -291,7 +293,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
             self.src,
             r"
         {anyhow}::Ok([",
-            anyhow = self.gen.anyhow_path(),
+            anyhow = self.r#gen.anyhow_path(),
         );
         for func in &funcs_to_export {
             let name = to_rust_ident(&func.name);
@@ -306,12 +308,12 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     ::std::boxed::Box::pin(
                         {futures}::TryStreamExt::map_ok({}_{name}, move |(cx, ("#,
                 match func.kind {
-                    FunctionKind::Freestanding => "f",
-                    FunctionKind::Method(_) => "m",
+                    FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => "f",
+                    FunctionKind::Method(_) | FunctionKind::AsyncMethod(_) => "m",
                     FunctionKind::Constructor(_) => "c",
-                    FunctionKind::Static(_) => "s",
+                    FunctionKind::Static(_) | FunctionKind::AsyncStatic(_) => "s",
                 },
-                futures = self.gen.futures_path(),
+                futures = self.r#gen.futures_path(),
                 wit_name = func.name,
             );
             for i in 0..func.params.len() {
@@ -325,10 +327,14 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                             ::std::boxed::Box::pin(async move {{"
             );
             let (trait_name, name) = match func.kind {
-                FunctionKind::Freestanding => ("Handler", name),
+                FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {
+                    ("Handler", to_rust_ident(func.item_name()).to_string())
+                }
                 FunctionKind::Method(id)
                 | FunctionKind::Constructor(id)
-                | FunctionKind::Static(id) => (
+                | FunctionKind::Static(id)
+                | FunctionKind::AsyncMethod(id)
+                | FunctionKind::AsyncStatic(id) => (
                     traits
                         .get(&Some(id))
                         .map(|(name, _)| name.as_str())
@@ -346,8 +352,8 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                                 let rx = rx.map({tracing}::Instrument::in_current_span).map({tokio}::spawn);
                                 {tracing}::trace!(instance = "{instance}", func = "{wit_name}", "calling handler");
                                 match {trait_name}::{name}(&handler, cx"#,
-                tokio = self.gen.tokio_path(),
-                tracing = self.gen.tracing_path(),
+                tokio = self.r#gen.tokio_path(),
+                tracing = self.r#gen.tracing_path(),
                 wit_name = func.name,
             );
             for i in 0..func.params.len() {
@@ -360,7 +366,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                                     Ok(results) => {{
                                         match tx(",
             );
-            if func.results.len() == 1 {
+            if func.result.iter().len() == 1 {
                 // wrap single-element results into a tuple for correct indexing
                 self.push_str("(results,)");
             } else {
@@ -427,9 +433,9 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     >
                 )
             }},"#,
-                anyhow = self.gen.anyhow_path(),
-                futures = self.gen.futures_path(),
-                tracing = self.gen.tracing_path(),
+                anyhow = self.r#gen.anyhow_path(),
+                futures = self.r#gen.futures_path(),
+                tracing = self.r#gen.tracing_path(),
                 wit_name = func.name,
             );
         }
@@ -509,21 +515,21 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
 ",
         );
         let map = if self.in_import {
-            &mut self.gen.import_modules
+            &mut self.r#gen.import_modules
         } else {
-            &mut self.gen.export_modules
+            &mut self.r#gen.export_modules
         };
         map.push((module, module_path));
     }
 
     fn generate_guest_import(&mut self, instance: &str, func: &Function) {
-        if self.gen.skip.contains(&func.name) {
+        if self.r#gen.skip.contains(&func.name) {
             return;
         }
 
         let mut sig = FnSig::default();
         match func.kind {
-            FunctionKind::Method(id) => {
+            FunctionKind::Method(id) | FunctionKind::AsyncMethod(id) => {
                 let name = self.resolve.types[id].name.as_ref().unwrap();
                 let name = to_upper_camel_case(name);
                 uwriteln!(self.src, "impl {name} {{");
@@ -532,49 +538,52 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 sig.self_arg = Some("&self".into());
                 sig.self_is_first_param = true;
             }
-            FunctionKind::Static(id) | FunctionKind::Constructor(id) => {
+            FunctionKind::Static(id)
+            | FunctionKind::Constructor(id)
+            | FunctionKind::AsyncStatic(id) => {
                 let name = self.resolve.types[id].name.as_ref().unwrap();
                 let name = to_upper_camel_case(name);
                 uwriteln!(self.src, "impl {name} {{");
 
                 sig.use_item_name = true;
             }
-            FunctionKind::Freestanding => {}
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {}
         }
         self.src.push_str("#[allow(clippy::all)]\n");
 
-        let async_params = func.params.iter().any(|(_, ty)| {
-            let (paths, fut) = async_paths_ty(self.resolve, ty);
+        let async_params = func.params.iter().any(|param| {
+            let (paths, fut) = async_paths_ty(self.resolve, &param.ty);
             fut || !paths.is_empty()
         });
-        let paths = func.results.iter_types().enumerate().fold(
-            BTreeSet::default(),
-            |mut paths, (i, ty)| {
-                let (nested, fut) = async_paths_ty(self.resolve, ty);
-                for path in nested {
-                    let mut s = String::with_capacity(7 + path.len() * 6);
-                    s.push_str(&format!("[Some({i})"));
-                    for i in path {
-                        if let Some(i) = i {
-                            s.push_str(&format!(", Some({i})"));
-                        } else {
-                            s.push_str(", None");
+        let paths =
+            func.result
+                .iter()
+                .enumerate()
+                .fold(BTreeSet::default(), |mut paths, (i, ty)| {
+                    let (nested, fut) = async_paths_ty(self.resolve, ty);
+                    for path in nested {
+                        let mut s = String::with_capacity(7 + path.len() * 6);
+                        s.push_str(&format!("[Some({i})"));
+                        for i in path {
+                            if let Some(i) = i {
+                                s.push_str(&format!(", Some({i})"));
+                            } else {
+                                s.push_str(", None");
+                            }
                         }
+                        s.push(']');
+                        paths.insert(s);
                     }
-                    s.push(']');
-                    paths.insert(s);
-                }
-                if fut {
-                    paths.insert(format!("[Some({i})]"));
-                }
-                paths
-            },
-        );
+                    if fut {
+                        paths.insert(format!("[Some({i})]"));
+                    }
+                    paths
+                });
 
-        let anyhow = self.gen.anyhow_path().to_string();
+        let anyhow = self.r#gen.anyhow_path().to_string();
 
         let params = self.print_docs_and_params(func, &sig);
-        match func.results.iter_types().collect::<Vec<_>>().as_slice() {
+        match func.result.iter().collect::<Vec<_>>().as_slice() {
             [] => {
                 uwrite!(
                     self.src,
@@ -593,8 +602,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 if async_params || !paths.is_empty() {
                     uwrite!(
                         self.src,
-                        ", ::core::option::Option<impl ::core::future::Future<Output = {anyhow}::Result<()>> + ::core::marker::Send + 'static + {wrpc_transport}::Captures<'a>>)",
-                        wrpc_transport = self.gen.wrpc_transport_path(),
+                        ", ::core::option::Option<impl ::core::future::Future<Output = {anyhow}::Result<()>> + ::core::marker::Send + 'static + use<'a, C__>>)",
                     );
                 }
                 uwrite!(self.src, ">> + Send + 'a");
@@ -611,8 +619,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 if async_params || !paths.is_empty() {
                     uwrite!(
                         self.src,
-                        "::core::option::Option<impl ::core::future::Future<Output = {anyhow}::Result<()>> + ::core::marker::Send + 'static + {wrpc_transport}::Captures<'a>>",
-                        wrpc_transport = self.gen.wrpc_transport_path(),
+                        "::core::option::Option<impl ::core::future::Future<Output = {anyhow}::Result<()>> + ::core::marker::Send + 'static + use<'a, C__>>",
                     );
                 }
                 uwrite!(self.src, ")>> + Send + 'a");
@@ -624,14 +631,14 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         async move {",
         );
 
-        if func.results.len() == 0 || (!async_params && paths.is_empty()) {
+        if func.result.iter().len() == 0 || (!async_params && paths.is_empty()) {
             uwrite!(
                 self.src,
                 r#"
                 let wrpc__ = {anyhow}::Context::context(
                     {wrpc_transport}::InvokeExt::invoke_values_blocking(wrpc__, cx__, "{instance}", "{}", ({params}), "#,
                 rpc_func_name(func),
-                wrpc_transport = self.gen.wrpc_transport_path(),
+                wrpc_transport = self.r#gen.wrpc_transport_path(),
                 params = {
                     let s = params.join(", ");
                     if params.len() == 1 {
@@ -657,7 +664,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     "failed to invoke `{instance}.{}`")?;"#,
                 func.name,
             );
-            if func.results.len() == 1 {
+            if func.result.iter().len() == 1 {
                 self.push_str("let (wrpc__,) = wrpc__;\n");
             }
             self.push_str("Ok(wrpc__)\n");
@@ -668,7 +675,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 let (wrpc__, io__) = {anyhow}::Context::context(
                     {wrpc_transport}::InvokeExt::invoke_values(wrpc__, cx__, "{instance}", "{}", ({params}), "#,
                 rpc_func_name(func),
-                wrpc_transport = self.gen.wrpc_transport_path(),
+                wrpc_transport = self.r#gen.wrpc_transport_path(),
                 params = {
                     let s = params.join(", ");
                     if params.len() == 1 {
@@ -694,17 +701,17 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     "failed to invoke `{instance}.{}`")?;"#,
                 func.name,
             );
-            if func.results.len() == 1 {
+            if func.result.iter().len() == 1 {
                 self.push_str("let (wrpc__,) = wrpc__;\n");
                 self.push_str("Ok((wrpc__, io__))\n");
             } else {
                 self.push_str("let (");
-                for i in 0..func.results.len() {
+                for i in 0..func.result.iter().len() {
                     uwrite!(self.src, "r{i}__, ");
                 }
                 self.push_str(") = wrpc__;\n");
                 self.push_str("Ok((");
-                for i in 0..func.results.len() {
+                for i in 0..func.result.iter().len() {
                     uwrite!(self.src, "r{i}__, ");
                 }
                 self.push_str("io__))\n");
@@ -718,8 +725,12 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         );
 
         match func.kind {
-            FunctionKind::Freestanding => {}
-            FunctionKind::Method(_) | FunctionKind::Static(_) | FunctionKind::Constructor(_) => {
+            FunctionKind::Freestanding | FunctionKind::AsyncFreestanding => {}
+            FunctionKind::Method(_)
+            | FunctionKind::Static(_)
+            | FunctionKind::Constructor(_)
+            | FunctionKind::AsyncMethod(_)
+            | FunctionKind::AsyncStatic(_) => {
                 self.src.push_str("}\n");
             }
         }
@@ -740,7 +751,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         }
     }
 
-    fn rustdoc_params(&mut self, docs: &[(String, Type)], header: &str) {
+    fn rustdoc_params(&mut self, docs: &[Param], header: &str) {
         let _ = (docs, header);
         // let docs = docs
         //     .iter()
@@ -793,13 +804,13 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                 self.push_str(&to_rust_ident(func.item_name()));
             }
         } else {
-            self.push_str(&to_rust_ident(&func.name));
+            self.push_str(&to_rust_ident(func.item_name()));
         };
         if self.in_import {
             uwrite!(
                 self.src,
-                "<'a, C: {wrpc_transport}::Invoke>(wrpc__: &'a C, cx__: C::Context,",
-                wrpc_transport = self.gen.wrpc_transport_path(),
+                "<'a, C__: {wrpc_transport}::Invoke>(wrpc__: &'a C__, cx__: C__::Context,",
+                wrpc_transport = self.r#gen.wrpc_transport_path(),
             );
         } else {
             self.push_str("(");
@@ -810,7 +821,13 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
             self.push_str("cx: Ctx,");
         }
         let mut params = Vec::new();
-        for (i, (name, param)) in func.params.iter().enumerate() {
+        for (
+            i,
+            Param {
+                name, ty: param, ..
+            },
+        ) in func.params.iter().enumerate()
+        {
             if i == 0 && sig.self_is_first_param && !self.in_import {
                 continue;
             }
@@ -832,6 +849,25 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn print_ty(&mut self, ty: &Type, owned: bool, submodule: bool) {
+        // If we have a typedef of a string or a list and it is being borrowed,
+        // the typedef is an alias for `String` or `Vec<T>`; borrow it as `&str`
+        // or `&[T]` so callers don't need to create owned copies.
+        if !owned && let Type::Id(id) = ty {
+            let id = dealias(self.resolve, *id);
+            match &self.resolve.types[id].kind {
+                TypeDefKind::Type(Type::String) => {
+                    self.push_str("&'a str");
+                    return;
+                }
+                TypeDefKind::List(element) => {
+                    let element = *element;
+                    self.print_list(&element, false, submodule);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match ty {
             Type::Id(t) => self.print_tyid(*t, owned, submodule),
             Type::Bool => self.push_str("bool"),
@@ -853,6 +889,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
                     self.push_str("&'a str");
                 }
             }
+            Type::ErrorContext => self.push_str("()"),
         }
     }
 
@@ -866,13 +903,13 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn type_path_with_name(&self, id: TypeId, name: String, submodule: bool) -> String {
-        if let TypeOwner::Interface(id) = self.resolve.types[id].owner {
-            if let Some(path) = self.path_to_interface(id) {
-                if submodule {
-                    return format!("super::{path}::{name}");
-                } else {
-                    return format!("{path}::{name}");
-                }
+        if let TypeOwner::Interface(id) = self.resolve.types[id].owner
+            && let Some(path) = self.path_to_interface(id)
+        {
+            if submodule {
+                return format!("super::{path}::{name}");
+            } else {
+                return format!("{path}::{name}");
             }
         }
         if submodule {
@@ -920,6 +957,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
             Type::F64 => self.push_str("f64"),
             Type::Char => self.push_str("char"),
             Type::String => self.push_str("&'a str"),
+            Type::ErrorContext => self.push_str("()"),
         }
     }
 
@@ -949,7 +987,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     fn print_list(&mut self, ty: &Type, owned: bool, submodule: bool) {
         if owned {
             if is_ty(self.resolve, Type::U8, ty) {
-                uwrite!(self.src, "{bytes}::Bytes", bytes = self.gen.bytes_path());
+                uwrite!(self.src, "{bytes}::Bytes", bytes = self.r#gen.bytes_path());
             } else {
                 self.push_str("Vec<");
                 self.print_ty(ty, true, submodule);
@@ -959,7 +997,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
             uwrite!(
                 self.src,
                 "&'a {bytes}::Bytes",
-                bytes = self.gen.bytes_path()
+                bytes = self.r#gen.bytes_path()
             );
         } else {
             self.push_str("&'a [");
@@ -978,11 +1016,11 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
         self.push_str("> + ::core::marker::Send>>");
     }
 
-    fn print_stream(&mut self, Stream { element, .. }: &Stream, submodule: bool) {
+    fn print_stream(&mut self, element: &Option<Type>, submodule: bool) {
         uwrite!(
             self.src,
             "::core::pin::Pin<::std::boxed::Box<dyn {futures}::Stream<Item = ",
-            futures = self.gen.futures_path()
+            futures = self.r#gen.futures_path()
         );
         if let Some(ty) = element {
             self.print_list(ty, true, submodule);
@@ -993,14 +1031,14 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn print_own(&mut self, id: TypeId, submodule: bool) {
-        self.src.push_str(self.gen.wrpc_transport_path());
+        self.src.push_str(self.r#gen.wrpc_transport_path());
         self.push_str("::ResourceOwn<");
         self.print_tyid(id, true, submodule);
         self.push_str(">");
     }
 
     fn print_borrow(&mut self, id: TypeId, submodule: bool) {
-        self.src.push_str(self.gen.wrpc_transport_path());
+        self.src.push_str(self.r#gen.wrpc_transport_path());
         self.push_str("::ResourceBorrow<");
         self.print_tyid(id, true, submodule);
         self.push_str(">");
@@ -1009,12 +1047,24 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     fn print_tyid(&mut self, id: TypeId, owned: bool, submodule: bool) {
         let ty = &self.resolve.types[id];
         if let Some(name) = &ty.name {
-            let name = self.type_path_with_name(id, to_upper_camel_case(name), submodule);
-            self.push_str(&name);
+            let full_wit_type_name = full_wit_type_name(self.resolve, id);
+            if let Some(TypeGeneration::Remap(remapped_path)) =
+                self.r#gen.with.get(&full_wit_type_name)
+            {
+                let remapped_path = remapped_path.clone();
+                self.push_str(&remapped_path);
+            } else {
+                let name = self.type_path_with_name(id, to_upper_camel_case(name), submodule);
+                self.push_str(&name);
+            }
             return;
         }
         match &ty.kind {
             TypeDefKind::List(ty) => self.print_list(ty, owned, submodule),
+            TypeDefKind::FixedLengthList(..) => {
+                panic!("unsupported anonymous type reference: fixed size list")
+            }
+            TypeDefKind::Map(..) => panic!("unsupported anonymous type reference: map"),
             TypeDefKind::Option(ty) => self.print_option(ty, owned, submodule),
             TypeDefKind::Result(ty) => self.print_result(ty, owned, submodule),
             TypeDefKind::Variant(_) => panic!("unsupported anonymous variant"),
@@ -1037,7 +1087,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn name_of(&self, ty: TypeId) -> Option<String> {
-        (self.gen.opts.generate_unused_types
+        (self.r#gen.opts.generate_unused_types
             // If this type isn't actually used, no need to generate it.
             || matches!(
                 self.info(ty),
@@ -1091,7 +1141,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn path_to_interface(&self, interface: InterfaceId) -> Option<String> {
-        let InterfaceName { path, remapped } = &self.gen.interface_names[&interface];
+        let InterfaceName { path, remapped } = &self.r#gen.interface_names[&interface];
         if *remapped {
             let mut path_to_root = self.path_to_root();
             path_to_root.push_str(path);
@@ -1124,7 +1174,7 @@ pub fn serve_interface<'a, T: {wrpc_transport}::Serve>(
     }
 
     fn info(&self, ty: TypeId) -> TypeInfo {
-        self.gen.types.get(ty)
+        self.r#gen.types.get(ty)
     }
 }
 
@@ -1143,7 +1193,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         let info = self.info(id);
         // We use a BTree set to make sure we don't have any duplicates and we have a stable order
         let additional_derives: BTreeSet<String> = self
-            .gen
+            .r#gen
             .opts
             .additional_derive_attributes
             .iter()
@@ -1153,7 +1203,15 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
             let (paths, _) = async_paths_tyid(self.resolve, id);
 
             self.rustdoc(docs);
-            let mut derives = additional_derives.clone();
+            let mut derives = BTreeSet::new();
+            if !self
+                .r#gen
+                .opts
+                .additional_derive_ignore
+                .contains(&name.to_kebab_case())
+            {
+                derives.extend(additional_derives.clone());
+            }
             if info.is_copy() && paths.is_empty() {
                 self.push_str("#[repr(C)]\n");
                 if !derives.contains("Clone")
@@ -1182,7 +1240,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
                 self.push_str(")]\n");
             }
             uwriteln!(self.src, "pub struct {name} {{");
-            for Field { name, ty, docs } in fields {
+            for Field { name, ty, docs, .. } in fields {
                 self.rustdoc(docs);
                 self.push_str("pub ");
                 self.push_str(&to_rust_ident(name));
@@ -1194,46 +1252,38 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
 
             let mod_name = to_rust_ident(ty_name);
 
-            let bytes = self.gen.bytes_path().to_string();
-            let tokio = self.gen.tokio_path().to_string();
-            let tokio_util = self.gen.tokio_util_path().to_string();
-            let wrpc_transport = self.gen.wrpc_transport_path().to_string();
+            let bytes = self.r#gen.bytes_path().to_string();
+            let tokio = self.r#gen.tokio_path().to_string();
+            let tokio_util = self.r#gen.tokio_util_path().to_string();
+            let wrpc_transport = self.r#gen.wrpc_transport_path().to_string();
 
             let (paths, _) = async_paths_tyid(self.resolve, id);
             if paths.is_empty() {
                 uwriteln!(
                     self.src,
                     r"
-impl<W> {wrpc_transport}::Encode<W> for &self::{name}
-where
-    W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Encode for &self::{name}
 {{
-    type Encoder = {mod_name}::Encoder<W>;
+    type Encoder = {mod_name}::Encoder;
 }}",
                 );
             }
             uwriteln!(
                 self.src,
                 r"
-impl<W> {wrpc_transport}::Encode<W> for self::{name}
-where
-    W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Encode for self::{name}
 {{
-    type Encoder = {mod_name}::Encoder<W>;
+    type Encoder = {mod_name}::Encoder;
 }}
 
-impl<R> {wrpc_transport}::Decode<R> for self::{name}
-where
-    R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Decode for self::{name}
 {{
-    type Decoder = {mod_name}::Decoder<R>;
-    type ListDecoder = {wrpc_transport}::ListDecoder<Self::Decoder, R>;
+    type Decoder = {mod_name}::Decoder;
+    type ListDecoder = {wrpc_transport}::ListDecoder<Self::Decoder>;
 }}
 
 mod {mod_name} {{
-    pub struct Encoder<W> 
-    where
-        W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+    pub struct Encoder 
     {{",
             );
 
@@ -1242,18 +1292,16 @@ mod {mod_name} {{
                     let name = to_rust_ident(name);
                     uwrite!(self.src, "{name}: <");
                     self.print_ty(ty, true, true);
-                    uwriteln!(self.src, " as {wrpc_transport}::Encode<W>>::Encoder,");
+                    uwriteln!(self.src, " as {wrpc_transport}::Encode>::Encoder,");
                 }
             } else {
-                uwriteln!(self.src, "_ty: ::core::marker::PhantomData<W>,");
+                uwriteln!(self.src, "_ty: ::core::marker::PhantomData<()>,");
             }
             uwriteln!(
                 self.src,
                 r"}}
     #[automatically_derived]
-    impl<W> ::core::default::Default for Encoder<W>
-    where
-        W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+    impl ::core::default::Default for Encoder
     {{
         fn default() -> Self {{
             Self{{"
@@ -1273,11 +1321,9 @@ mod {mod_name} {{
     }}
 
     #[automatically_derived]
-    impl<W> {wrpc_transport}::Deferred<W> for Encoder<W>
-    where
-        W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+    impl {wrpc_transport}::Deferred<{wrpc_transport}::frame::Outgoing> for Encoder
     {{
-        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<W>> {{"
+        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::frame::Outgoing>> {{"
             );
             if !fields.is_empty() {
                 for Field { name, .. } in fields {
@@ -1302,7 +1348,7 @@ mod {mod_name} {{
                         r"
                         let f_{name} = f_{name}.map(|f| {{
                             path.push({i});
-                            let w = {wrpc_transport}::Index::index(&w, &path);
+                            let w = w.index(&path);
                             path.pop();
                             (f, w)
                         }});"
@@ -1345,9 +1391,7 @@ mod {mod_name} {{
         }}
     }}
 
-    pub struct Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    pub struct Decoder
     {{"
             );
 
@@ -1356,21 +1400,19 @@ mod {mod_name} {{
                     let name = to_rust_ident(name);
                     uwrite!(self.src, "c_{name}: <");
                     self.print_ty(ty, true, true);
-                    uwriteln!(self.src, " as {wrpc_transport}::Decode<R>>::Decoder,");
+                    uwriteln!(self.src, " as {wrpc_transport}::Decode>::Decoder,");
                     uwrite!(self.src, "v_{name}: ::core::option::Option<");
                     self.print_ty(ty, true, true);
                     uwriteln!(self.src, ">,");
                 }
             } else {
-                uwriteln!(self.src, "_ty: ::core::marker::PhantomData<R>,");
+                uwriteln!(self.src, "_ty: ::core::marker::PhantomData<()>,");
             }
             uwriteln!(
                 self.src,
                 r"}}
     #[automatically_derived]
-    impl<R> ::core::default::Default for Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl ::core::default::Default for Decoder
     {{
         fn default() -> Self {{
             Self{{"
@@ -1391,11 +1433,9 @@ mod {mod_name} {{
     }}
 
     #[automatically_derived]
-    impl<R> {wrpc_transport}::Deferred<{wrpc_transport}::Incoming<R>> for Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl {wrpc_transport}::Deferred<{wrpc_transport}::BufferedIncoming> for Decoder
     {{
-        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::Incoming<R>>> {{"
+        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::BufferedIncoming>> {{"
             );
             if !fields.is_empty() {
                 for Field { name, .. } in fields {
@@ -1420,7 +1460,7 @@ mod {mod_name} {{
                         r"
                         let f_{name} = f_{name}.map(|f| {{
                             path.push({i});
-                            let r = {wrpc_transport}::Index::index(&r, &path);
+                            let r = r.index(&path);
                             path.pop();
                             (f, r)
                         }});"
@@ -1464,9 +1504,7 @@ mod {mod_name} {{
     }}
 
     #[automatically_derived]
-    impl<R> {tokio_util}::codec::Decoder for Decoder<R> 
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl {tokio_util}::codec::Decoder for Decoder 
     {{
         type Item = super::{name};
         type Error = ::std::io::Error;
@@ -1504,9 +1542,7 @@ mod {mod_name} {{
                     self.src,
                     r#"
     #[automatically_derived]
-    impl<W> {tokio_util}::codec::Encoder<{name}> for Encoder<W> 
-    where
-        W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+    impl {tokio_util}::codec::Encoder<{name}> for Encoder 
     {{
         type Error = ::std::io::Error;
 
@@ -1573,7 +1609,7 @@ mod {mod_name} {{
                 self.push_str("write!(f, \"{:?}\", self)\n");
                 self.push_str("}\n");
                 self.push_str("}\n");
-                self.push_str("impl ::std::error::Error for ");
+                self.push_str("impl ::core::error::Error for ");
                 self.push_str(&name);
                 self.push_str(" {}\n");
             }
@@ -1602,11 +1638,11 @@ pub struct {}(());",
 
     fn type_flags(&mut self, id: TypeId, ty_name: &str, flags: &Flags, docs: &Docs) {
         if let Some(name) = self.name_of(id) {
-            let bitflags = self.gen.bitflags_path().to_string();
-            let bytes = self.gen.bytes_path().to_string();
-            let tokio_util = self.gen.tokio_util_path().to_string();
-            let wasm_tokio = self.gen.wasm_tokio_path().to_string();
-            let wrpc_transport = self.gen.wrpc_transport_path().to_string();
+            let bitflags = self.r#gen.bitflags_path().to_string();
+            let bytes = self.r#gen.bytes_path().to_string();
+            let tokio_util = self.r#gen.tokio_util_path().to_string();
+            let wasm_tokio = self.r#gen.wasm_tokio_path().to_string();
+            let wrpc_transport = self.r#gen.wrpc_transport_path().to_string();
 
             let mod_name = to_rust_ident(ty_name);
 
@@ -1639,19 +1675,19 @@ pub struct {}(());",
             uwriteln!(
                 self.src,
                 r#"
-impl<W> {wrpc_transport}::Encode<W> for self::{name} {{
+impl {wrpc_transport}::Encode for self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &self::{name} {{
+impl {wrpc_transport}::Encode for &self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &&self::{name} {{
+impl {wrpc_transport}::Encode for &&self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<R> {wrpc_transport}::Decode<R> for self::{name} {{
+impl {wrpc_transport}::Decode for self::{name} {{
     type Decoder = {mod_name}::Codec;
     type ListDecoder = {wrpc_transport}::SyncCodec<{wasm_tokio}::CoreVecDecoder<Self::Decoder>>;
 }}
@@ -1732,7 +1768,7 @@ mod {mod_name} {{
         let info = self.info(id);
         // We use a BTree set to make sure we don't have any duplicates and have a stable order
         let additional_derives: BTreeSet<String> = self
-            .gen
+            .r#gen
             .opts
             .additional_derive_attributes
             .iter()
@@ -1742,7 +1778,15 @@ mod {mod_name} {{
             let (paths, _) = async_paths_tyid(self.resolve, id);
 
             self.rustdoc(docs);
-            let mut derives = additional_derives.clone();
+            let mut derives = BTreeSet::new();
+            if !self
+                .r#gen
+                .opts
+                .additional_derive_ignore
+                .contains(&name.to_kebab_case())
+            {
+                derives.extend(additional_derives.clone());
+            }
             if info.is_copy() && paths.is_empty() {
                 derives.extend(
                     ["::core::marker::Copy", "::core::clone::Clone"]
@@ -1791,15 +1835,15 @@ mod {mod_name} {{
                 self.push_str("\n");
 
                 self.push_str("impl");
-                self.push_str(" ::std::error::Error for ");
+                self.push_str(" ::core::error::Error for ");
                 self.push_str(&name);
                 self.push_str(" {}\n");
             }
 
-            let bytes = self.gen.bytes_path().to_string();
-            let tokio_util = self.gen.tokio_util_path().to_string();
-            let wasm_tokio = self.gen.wasm_tokio_path().to_string();
-            let wrpc_transport = self.gen.wrpc_transport_path().to_string();
+            let bytes = self.r#gen.bytes_path().to_string();
+            let tokio_util = self.r#gen.tokio_util_path().to_string();
+            let wasm_tokio = self.r#gen.wasm_tokio_path().to_string();
+            let wrpc_transport = self.r#gen.wrpc_transport_path().to_string();
 
             let mod_name = to_rust_ident(ty_name);
 
@@ -1807,19 +1851,19 @@ mod {mod_name} {{
                 uwriteln!(
                     self.src,
                     r#"
-impl<W> {wrpc_transport}::Encode<W> for self::{name} {{
+impl {wrpc_transport}::Encode for self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &self::{name} {{
+impl {wrpc_transport}::Encode for &self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &&self::{name} {{
+impl {wrpc_transport}::Encode for &&self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<R> {wrpc_transport}::Decode<R> for self::{name} {{
+impl {wrpc_transport}::Decode for self::{name} {{
     type Decoder = {mod_name}::Codec;
     type ListDecoder = {wrpc_transport}::SyncCodec<{wasm_tokio}::CoreVecDecoder<Self::Decoder>>;
 }}
@@ -1895,25 +1939,19 @@ mod {mod_name} {{
 }}"#,
                 );
             } else {
-                let tokio = self.gen.tokio_path().to_string();
-
                 let (paths, _) = async_paths_tyid(self.resolve, id);
                 if paths.is_empty() {
                     uwrite!(
                         self.src,
                         r#"
-impl<W> {wrpc_transport}::Encode<W> for &self::{name}
-where
-    W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Encode for &self::{name}
 {{
-    type Encoder = {mod_name}::Encoder<W>;
+    type Encoder = {mod_name}::Encoder;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &&self::{name}
-where
-    W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Encode for &&self::{name}
 {{
-    type Encoder = {mod_name}::Encoder<W>;
+    type Encoder = {mod_name}::Encoder;
 }}
 "#
                     );
@@ -1922,34 +1960,30 @@ where
                 uwrite!(
                     self.src,
                     r#"
-impl<W> {wrpc_transport}::Encode<W> for self::{name}
-where
-    W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Encode for self::{name}
 {{
-    type Encoder = {mod_name}::Encoder<W>;
+    type Encoder = {mod_name}::Encoder;
 }}
 
-impl<R> {wrpc_transport}::Decode<R> for self::{name}
-where
-    R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+impl {wrpc_transport}::Decode for self::{name}
 {{
-    type Decoder = {mod_name}::Decoder<R>;
-    type ListDecoder = {wrpc_transport}::ListDecoder<Self::Decoder, R>;
+    type Decoder = {mod_name}::Decoder;
+    type ListDecoder = {wrpc_transport}::ListDecoder<Self::Decoder>;
 }}
 
 mod {mod_name} {{
-    pub struct Encoder<W>(::core::option::Option<{wrpc_transport}::DeferredFn<W>>);
+    pub struct Encoder(::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::frame::Outgoing>>);
 
     #[automatically_derived]
-    impl<W> ::core::default::Default for Encoder<W> {{
+    impl ::core::default::Default for Encoder {{
         fn default() -> Self {{ 
             Self(None)
         }}
     }}
 
     #[automatically_derived]
-    impl<W> {wrpc_transport}::Deferred<W> for Encoder<W> {{
-        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<W>> {{
+    impl {wrpc_transport}::Deferred<{wrpc_transport}::frame::Outgoing> for Encoder {{
+        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::frame::Outgoing>> {{
             self.0.take()
         }}
     }}"#
@@ -1967,9 +2001,7 @@ mod {mod_name} {{
                         self.src,
                         r#"
     #[automatically_derived]
-    impl<W> {tokio_util}::codec::Encoder<{ty}> for Encoder<W> 
-    where
-        W: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<W> + {tokio}::io::AsyncWrite + ::core::marker::Unpin + 'static,
+    impl {tokio_util}::codec::Encoder<{ty}> for Encoder 
     {{
         type Error = ::std::io::Error;
 
@@ -1992,7 +2024,7 @@ mod {mod_name} {{
                                 r"
                 super::{name}::{case}(payload) => {{
                     {wasm_tokio}::Leb128Encoder.encode({i}_u32, dst)?;
-                    self.0 = {wrpc_transport}::Encode::<W>::encode(payload, &mut ::core::default::Default::default(), dst)?;
+                    self.0 = {wrpc_transport}::Encode::encode(payload, &mut ::core::default::Default::default(), dst)?;
                     Ok(())
                 }},"
                             );
@@ -2016,9 +2048,7 @@ mod {mod_name} {{
                 uwrite!(
                     self.src,
                     r"
-    pub enum PayloadDecoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    pub enum PayloadDecoder
     {{"
                 );
 
@@ -2036,7 +2066,7 @@ mod {mod_name} {{
                 {case}(<"
                         );
                         self.print_ty(ty, true, true);
-                        uwriteln!(self.src, " as {wrpc_transport}::Decode<R>>::Decoder),");
+                        uwriteln!(self.src, " as {wrpc_transport}::Decode>::Decoder),");
                     }
                 }
 
@@ -2045,18 +2075,14 @@ mod {mod_name} {{
                     r#"
     }}
 
-    pub enum Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    pub enum Decoder
     {{
-        Payload(::core::option::Option<PayloadDecoder<R>>),
-        Deferred(::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::Incoming<R>>>)
+        Payload(::core::option::Option<PayloadDecoder>),
+        Deferred(::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::BufferedIncoming>>)
     }}
 
     #[automatically_derived]
-    impl<R> ::core::default::Default for Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl ::core::default::Default for Decoder
     {{
         fn default() -> Self {{
             Self::Payload(None)
@@ -2064,11 +2090,9 @@ mod {mod_name} {{
     }}
 
     #[automatically_derived]
-    impl<R> {wrpc_transport}::Deferred<{wrpc_transport}::Incoming<R>> for Decoder<R>
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl {wrpc_transport}::Deferred<{wrpc_transport}::BufferedIncoming> for Decoder
     {{
-        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::Incoming<R>>> {{
+        fn take_deferred(&mut self) -> ::core::option::Option<{wrpc_transport}::DeferredFn<{wrpc_transport}::BufferedIncoming>> {{
             match self {{
                 Self::Payload(None) => None,"#
                 );
@@ -2083,7 +2107,7 @@ mod {mod_name} {{
                         uwrite!(
                             self.src,
                             r"
-                Self::Payload(Some(PayloadDecoder::{case}(ref mut dec))) => dec.take_deferred(),"
+                Self::Payload(Some(PayloadDecoder::{case}(dec))) => dec.take_deferred(),"
                         );
                     }
                 }
@@ -2100,15 +2124,13 @@ mod {mod_name} {{
     }}
 
     #[automatically_derived]
-    impl<R> {tokio_util}::codec::Decoder for Decoder<R> 
-    where
-        R: ::core::marker::Send + ::core::marker::Sync + {wrpc_transport}::Index<R> + {tokio}::io::AsyncRead + ::core::marker::Unpin + 'static,
+    impl {tokio_util}::codec::Decoder for Decoder 
     {{
         type Item = super::{name};
         type Error = ::std::io::Error;
 
         fn decode(&mut self, src: &mut {bytes}::BytesMut) -> ::core::result::Result<::core::option::Option<Self::Item>, Self::Error> {{
-            let state = if let Self::Payload(Some(ref mut state)) = self {{
+            let state = if let Self::Payload(Some(state)) = self {{
                 state
             }} else {{
                 let Some(disc) = {wasm_tokio}::Leb128DecoderU32.decode(src)? else {{
@@ -2132,7 +2154,7 @@ mod {mod_name} {{
                             r"
                     {i} => {{
                         *self = Self::Payload(::core::option::Option::default());
-                        let Self::Payload(ref mut dec) = self else {{
+                        let Self::Payload(dec) = self else {{
                             unreachable!()
                         }};
                         dec.insert(PayloadDecoder::{case}(::core::default::Default::default()))
@@ -2170,7 +2192,7 @@ mod {mod_name} {{
                             let Some(payload) = dec.decode(src)? else {{
                                 return Ok(None)
                             }};
-                            *self = Self::Deferred({wrpc_transport}::Deferred::<{wrpc_transport}::Incoming<R>>::take_deferred(dec));
+                            *self = Self::Deferred({wrpc_transport}::Deferred::<{wrpc_transport}::BufferedIncoming>::take_deferred(dec));
                             Ok(Some(super::{name}::{case}(payload)))
                         }},"
                         );
@@ -2215,13 +2237,15 @@ mod {mod_name} {{
             self.int_repr(enum_.tag());
             self.push_str(")]\n");
             // We use a BTree set to make sure we don't have any duplicates and a stable order
-            let mut derives: BTreeSet<String> = self
-                .gen
+            let mut derives: BTreeSet<String> = BTreeSet::new();
+            if !self
+                .r#gen
                 .opts
-                .additional_derive_attributes
-                .iter()
-                .cloned()
-                .collect();
+                .additional_derive_ignore
+                .contains(&name.to_kebab_case())
+            {
+                derives.extend(self.r#gen.opts.additional_derive_attributes.iter().cloned());
+            }
             derives.extend(
                 [
                     ":: core :: clone :: Clone",
@@ -2306,7 +2330,7 @@ mod {mod_name} {{
                 self.push_str("}\n");
                 self.push_str("}\n");
                 self.push_str("\n");
-                self.push_str("impl ::std::error::Error for ");
+                self.push_str("impl ::core::error::Error for ");
                 self.push_str(&name);
                 self.push_str(" {}\n");
             } else {
@@ -2319,25 +2343,25 @@ mod {mod_name} {{
                 );
             }
 
-            let bytes = self.gen.bytes_path().to_string();
-            let tokio_util = self.gen.tokio_util_path().to_string();
-            let wasm_tokio = self.gen.wasm_tokio_path().to_string();
-            let wrpc_transport = self.gen.wrpc_transport_path().to_string();
+            let bytes = self.r#gen.bytes_path().to_string();
+            let tokio_util = self.r#gen.tokio_util_path().to_string();
+            let wasm_tokio = self.r#gen.wasm_tokio_path().to_string();
+            let wrpc_transport = self.r#gen.wrpc_transport_path().to_string();
 
             let mod_name = to_rust_ident(ty_name);
 
             uwriteln!(
                 self.src,
                 r#"
-impl<W> {wrpc_transport}::Encode<W> for self::{name} {{
+impl {wrpc_transport}::Encode for self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<W> {wrpc_transport}::Encode<W> for &self::{name} {{
+impl {wrpc_transport}::Encode for &self::{name} {{
     type Encoder = {mod_name}::Codec;
 }}
 
-impl<R> {wrpc_transport}::Decode<R> for self::{name} {{
+impl {wrpc_transport}::Decode for self::{name} {{
     type Decoder = {mod_name}::Codec;
     type ListDecoder = {wrpc_transport}::SyncCodec<{wasm_tokio}::CoreVecDecoder<Self::Decoder>>;
 }}
@@ -2433,10 +2457,43 @@ mod {mod_name} {{
         }
     }
 
+    fn type_fixed_length_list(
+        &mut self,
+        _id: TypeId,
+        _name: &str,
+        _ty: &Type,
+        _size: u32,
+        _docs: &Docs,
+    ) {
+        panic!("unsupported type: fixed length list")
+    }
+
+    fn type_map(&mut self, _id: TypeId, _name: &str, _key: &Type, _value: &Type, _docs: &Docs) {
+        panic!("unsupported type: map")
+    }
+
     fn type_builtin(&mut self, _id: TypeId, name: &str, ty: &Type, docs: &Docs) {
         self.rustdoc(docs);
         uwrite!(self.src, "pub type {} = ", name.to_upper_camel_case());
         self.print_ty(ty, true, false);
         self.src.push_str(";\n");
+    }
+
+    fn type_future(&mut self, id: TypeId, _name: &str, ty: &Option<Type>, docs: &Docs) {
+        if let Some(name) = self.name_of(id) {
+            self.rustdoc(docs);
+            uwrite!(self.src, "pub type {name} = ");
+            self.print_future(ty, false);
+            self.push_str(";\n");
+        }
+    }
+
+    fn type_stream(&mut self, id: TypeId, _name: &str, ty: &Option<Type>, docs: &Docs) {
+        if let Some(name) = self.name_of(id) {
+            self.rustdoc(docs);
+            uwrite!(self.src, "pub type {name} = ");
+            self.print_stream(ty, false);
+            self.push_str(";\n");
+        }
     }
 }

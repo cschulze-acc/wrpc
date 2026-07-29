@@ -1,5 +1,5 @@
 use core::net::SocketAddr;
-use core::pin::{pin, Pin};
+use core::pin::{Pin, pin};
 
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use futures::stream::select_all;
 use futures::{Stream, StreamExt as _};
 use quinn::crypto::rustls::QuicServerConfig;
 use quinn::{Endpoint, ServerConfig};
-use rcgen::{generate_simple_self_signed, CertifiedKey};
+use rcgen::{CertifiedKey, generate_simple_self_signed};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use rustls::version::TLS13;
 use tokio::task::JoinSet;
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     let ep = Endpoint::server(ServerConfig::with_crypto(Arc::new(conf)), addr)
         .context("failed to create server endpoint")?;
 
-    let srv = Arc::new(wrpc_transport_quic::Server::new());
+    let srv = Arc::new(wrpc_quic::Server::new());
     let accept = tokio::spawn({
         let mut tasks = JoinSet::<anyhow::Result<()>>::new();
         let srv = Arc::clone(&srv);
@@ -94,11 +94,14 @@ async fn main() -> anyhow::Result<()> {
                                 .accept()
                                 .context("failed to accept QUIC connection")?;
                             let conn = conn.await.context("failed to establish QUIC connection")?;
-                            let wrpc = wrpc_transport_quic::Client::from(conn);
                             loop {
-                                srv.accept(&wrpc)
+                                let (tx, rx) = conn
+                                    .accept_bi()
                                     .await
                                     .context("failed to accept wRPC connection")?;
+                                srv.accept((), tx, rx)
+                                    .await
+                                    .context("failed to serve wRPC connection")?;
                             }
                         });
                     }
@@ -106,10 +109,10 @@ async fn main() -> anyhow::Result<()> {
                         match res {
                             Ok(Ok(())) => {}
                             Ok(Err(err)) => {
-                                warn!(?err, "failed to serve connection")
+                                warn!(?err, "failed to serve connection");
                             }
                             Err(err) => {
-                                error!(?err, "failed to join task")
+                                error!(?err, "failed to join task");
                             }
                         }
                     }
@@ -141,11 +144,11 @@ async fn main() -> anyhow::Result<()> {
                     Ok(fut) => {
                         debug!(instance, name, "invocation accepted");
                         tasks.spawn(async move {
-                            if let Err(err) = fut.await {
+                            match fut.await { Err(err) => {
                                 warn!(?err, "failed to handle invocation");
-                            } else {
+                            } _ => {
                                 info!(instance, name, "invocation successfully handled");
-                            }
+                            }}
                         });
                     }
                     Err(err) => {
@@ -155,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
             }
             Some(res) = tasks.join_next() => {
                 if let Err(err) = res {
-                    error!(?err, "failed to join task")
+                    error!(?err, "failed to join task");
                 }
             }
             res = &mut shutdown => {
@@ -163,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
                 // wait for all invocations to complete
                 while let Some(res) = tasks.join_next().await {
                     if let Err(err) = res {
-                        error!(?err, "failed to join task")
+                        error!(?err, "failed to join task");
                     }
                 }
                 return res.context("failed to listen for ^C")

@@ -23,8 +23,8 @@ tokio = { workspace = true, features = ["io-util"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing = { workspace = true, features = ["attributes"] }
 wasm-tokio = { workspace = true }
-wasm-wave = "0.251"
-wrpc-pack = { path = "../pack", optional = true }
+wasm-wave = { workspace = true }
+wrpc-pack = { workspace = true, optional = true }
 wrpc-transport = { workspace = true }
 
 [dev-dependencies]

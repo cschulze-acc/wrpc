@@ -6,14 +6,14 @@ use std::mem;
 use heck::ToUpperCamelCase;
 use wit_bindgen_core::wit_parser::{
     Case, Docs, Enum, EnumCase, Field, Flag, Flags, Function, FunctionKind, Handle, Int,
-    InterfaceId, Record, Resolve, Result_, Stream, Tuple, Type, TypeDefKind, TypeId, TypeOwner,
+    InterfaceId, Param, Record, Resolve, Result_, Tuple, Type, TypeDefKind, TypeId, TypeOwner,
     Variant, World, WorldKey,
 };
-use wit_bindgen_core::{uwrite, uwriteln, Source, TypeInfo};
+use wit_bindgen_core::{Source, TypeInfo, uwrite, uwriteln};
 use wrpc_introspect::{async_paths_ty, is_list_of, is_tuple, is_ty, rpc_func_name};
 
 use crate::{
-    to_go_ident, to_package_ident, to_upper_camel_case, Deps, GoWrpc, Identifier, InterfaceName,
+    Deps, GoWrpc, Identifier, InterfaceName, to_go_ident, to_package_ident, to_upper_camel_case,
 };
 
 fn go_func_name(func: &Function) -> String {
@@ -47,11 +47,39 @@ fn go_func_name(func: &Function) -> String {
                 tail.to_upper_camel_case()
             )
         }
+        FunctionKind::AsyncStatic(..) => {
+            let name = func
+                .name
+                .strip_prefix("[static]")
+                .expect("failed to strip `[static]` prefix");
+            let (head, tail) = name.split_once('.').expect("failed to split on `.`");
+            format!(
+                "{}_{}",
+                head.to_upper_camel_case(),
+                tail.to_upper_camel_case()
+            )
+        }
+        FunctionKind::AsyncMethod(..) => {
+            let name = func
+                .name
+                .strip_prefix("[method]")
+                .expect("failed to strip `[method]` prefix");
+            let (head, tail) = name.split_once('.').expect("failed to split on `.`");
+            format!(
+                "{}_{}",
+                head.to_upper_camel_case(),
+                tail.to_upper_camel_case()
+            )
+        }
+        FunctionKind::AsyncFreestanding => to_upper_camel_case(&func.name),
         FunctionKind::Freestanding => to_upper_camel_case(&func.name),
     }
 }
 
-pub fn flatten_ty<'a>(resolve: &'a Resolve, ty: &Type) -> impl Iterator<Item = Type> + 'a {
+pub fn flatten_ty<'a>(
+    resolve: &'a Resolve,
+    ty: &Type,
+) -> impl Iterator<Item = Type> + 'a + use<'a> {
     let mut ty = *ty;
     loop {
         if let Type::Id(id) = ty {
@@ -61,7 +89,7 @@ pub fn flatten_ty<'a>(resolve: &'a Resolve, ty: &Type) -> impl Iterator<Item = T
                     continue;
                 }
                 TypeDefKind::Tuple(ref t) => {
-                    return Box::new(t.types.iter().copied()) as Box<dyn Iterator<Item = _>>
+                    return Box::new(t.types.iter().copied()) as Box<dyn Iterator<Item = _>>;
                 }
                 _ => {}
             }
@@ -74,7 +102,7 @@ pub struct InterfaceGenerator<'a> {
     pub src: Source,
     pub(super) identifier: Identifier<'a>,
     pub in_import: bool,
-    pub(super) gen: &'a mut GoWrpc,
+    pub(super) r#gen: &'a mut GoWrpc,
     pub resolve: &'a Resolve,
     pub deps: Deps,
 }
@@ -1069,7 +1097,7 @@ impl InterfaceGenerator<'_> {
         }
     }
 
-    fn print_read_stream(&mut self, Stream { element, .. }: &Stream, reader: &str, path: &str) {
+    fn print_read_stream(&mut self, element: &Option<Type>, reader: &str, path: &str) {
         match element {
             Some(ty) if is_ty(self.resolve, Type::U8, ty) => {
                 let bytes = self.deps.bytes();
@@ -1341,6 +1369,7 @@ impl InterfaceGenerator<'_> {
             Type::F64 => self.print_read_f64(reader),
             Type::Char => self.print_read_char(reader),
             Type::String => self.print_read_string(reader),
+            Type::ErrorContext => panic!("error-context is not supported"),
         }
     }
 
@@ -1370,6 +1399,8 @@ impl InterfaceGenerator<'_> {
             TypeDefKind::Option(ty) => self.print_read_option(ty, reader, path),
             TypeDefKind::Result(ty) => self.print_read_result(ty, reader, path),
             TypeDefKind::List(ty) => self.print_read_list(ty, reader, path),
+            TypeDefKind::FixedLengthList(..) => panic!("unsupported type: fixed size list"),
+            TypeDefKind::Map(..) => panic!("unsupported type: map"),
             TypeDefKind::Future(ty) => self.print_read_future(ty, reader, path),
             TypeDefKind::Stream(ty) => self.print_read_stream(ty, reader, path),
             TypeDefKind::Type(ty) => {
@@ -2064,7 +2095,7 @@ impl InterfaceGenerator<'_> {
         }
     }
 
-    fn print_write_stream(&mut self, Stream { element, .. }: &Stream, name: &str, writer: &str) {
+    fn print_write_stream(&mut self, element: &Option<Type>, name: &str, writer: &str) {
         match element {
             Some(ty) if is_ty(self.resolve, Type::U8, ty) => {
                 let fmt = self.deps.fmt();
@@ -2175,36 +2206,38 @@ impl InterfaceGenerator<'_> {
                     if {math}.MaxUint32 - uint32(n) < total {{
                         return {errors}.New("total outgoing pending stream element count would overflow a 32-bit unsigned integer")
                     }}
-                    {slog}.Debug("writing pending stream chunk length", "len", n)
-                    _, err = {wrpc}.WriteUint32(uint32(n), w)
-                    if err != nil {{
-                        return {fmt}.Errorf("failed to write pending stream chunk length of %d: %w", n, err)
-                    }}
-                    for _, v := range chunk {{
-                        {slog}.Debug("writing pending stream element", "i", total)
-                        write, err :="#,
+                    if n > 0 {{
+                        {slog}.Debug("writing pending stream chunk length", "len", n)
+                        _, err = {wrpc}.WriteUint32(uint32(n), w)
+                        if err != nil {{
+                            return {fmt}.Errorf("failed to write pending stream chunk length of %d: %w", n, err)
+                        }}
+                        for _, v := range chunk {{
+                            {slog}.Debug("writing pending stream element", "i", total)
+                            write, err :="#,
                 );
                 self.print_write_ty(ty, "v", "w");
                 uwrite!(
                     self.src,
                     r#"
-                        if err != nil {{
-                            return {fmt}.Errorf("failed to write pending stream chunk element %d: %w", total, err)
-                        }}
-                        if write != nil {{
-                            wg.Add(1)
-                            w, err := w.Index(total)
                             if err != nil {{
-                                return {fmt}.Errorf("failed to index nested stream writer: %w", err)
+                                return {fmt}.Errorf("failed to write pending stream chunk element %d: %w", total, err)
                             }}
-                            go func() {{
-                                defer wg.Done()
-                                if err := write(w); err != nil {{
-                                    wgErr.Store(err)
+                            if write != nil {{
+                                wg.Add(1)
+                                w, err := w.Index(total)
+                                if err != nil {{
+                                    return {fmt}.Errorf("failed to index nested stream writer: %w", err)
                                 }}
-                            }}()
+                                go func() {{
+                                    defer wg.Done()
+                                    if err := write(w); err != nil {{
+                                        wgErr.Store(err)
+                                    }}
+                                }}()
+                            }}
+                            total++
                         }}
-                        total++
                     }}
                     if end {{
                         if err := w.WriteByte(0); err != nil {{
@@ -2294,6 +2327,7 @@ impl InterfaceGenerator<'_> {
                 uwrite!(self.src, "(func({wrpc}.IndexWriter) error)(nil), ");
                 self.print_write_string(name, writer);
             }
+            Type::ErrorContext => panic!("error-context is not supported"),
         }
     }
 
@@ -2444,7 +2478,7 @@ impl InterfaceGenerator<'_> {
         let mut funcs_to_export = vec![];
 
         for func in funcs {
-            if self.gen.skip.contains(&func.name) {
+            if self.r#gen.skip.contains(&func.name) {
                 continue;
             }
 
@@ -2453,8 +2487,8 @@ impl InterfaceGenerator<'_> {
             self.print_docs_and_params(func);
             self.src.push_str(" (");
             for ty in func
-                .results
-                .iter_types()
+                .result
+                .iter()
                 .flat_map(|ty| flatten_ty(self.resolve, ty))
             {
                 self.print_opt_ty(&ty, true);
@@ -2537,7 +2571,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             }}
         }}()"#,
             );
-            for (i, (_, ty)) in func.params.iter().enumerate() {
+            for (i, Param { ty, .. }) in func.params.iter().enumerate() {
                 uwrite!(
                     self.src,
                     r#"
@@ -2564,8 +2598,8 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         {slog}.DebugContext(ctx, "calling `{instance}.{name}` handler")"#,
             );
             let results: Box<[Type]> = func
-                .results
-                .iter_types()
+                .result
+                .iter()
                 .flat_map(|ty| flatten_ty(self.resolve, ty))
                 .collect();
             for (i, _) in results.iter().enumerate() {
@@ -2631,7 +2665,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             );
 
             let mut idx = 0usize;
-            for (i, ty) in func.results.iter_types().enumerate() {
+            for (i, ty) in func.result.iter().enumerate() {
                 for (j, _) in flatten_ty(self.resolve, ty).enumerate() {
                     uwrite!(
                         self.src,
@@ -2668,7 +2702,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         }}
     }}, "#,
             );
-            for (i, (_, ty)) in func.params.iter().enumerate() {
+            for (i, Param { ty, .. }) in func.params.iter().enumerate() {
                 let (nested, fut) = async_paths_ty(self.resolve, ty);
                 for path in nested {
                     self.push_str(wrpc);
@@ -2708,7 +2742,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         funcs: impl Iterator<Item = &'a Function>,
     ) {
         for func in funcs {
-            if self.gen.skip.contains(&func.name) {
+            if self.r#gen.skip.contains(&func.name) {
                 return;
             }
 
@@ -2719,8 +2753,8 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
 
             self.src.push_str(" (");
             let results: Box<[Type]> = func
-                .results
-                .iter_types()
+                .result
+                .iter()
                 .flat_map(|ty| flatten_ty(self.resolve, ty))
                 .collect();
             for (i, ty) in results.iter().enumerate() {
@@ -2729,8 +2763,8 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
                 self.src.push_str(", ");
             }
 
-            let async_params = func.params.iter().any(|(_, ty)| {
-                let (paths, fut) = async_paths_ty(self.resolve, ty);
+            let async_params = func.params.iter().any(|param| {
+                let (paths, fut) = async_paths_ty(self.resolve, &param.ty);
                 fut || !paths.is_empty()
             });
             if async_params {
@@ -2751,7 +2785,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
     var writeCount__ uint32"
                     );
                 }
-                for (i, (name, ty)) in func.params.iter().enumerate() {
+                for (i, Param { name, ty, .. }) in func.params.iter().enumerate() {
                     uwrite!(
                         self.src,
                         r"
@@ -2783,7 +2817,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
     writes__ := make(map[uint32]func({wrpc}.IndexWriter) error, uint(writeCount__))",
                     );
                 }
-                for (i, (name, _)) in func.params.iter().enumerate() {
+                for (i, Param { name, .. }) in func.params.iter().enumerate() {
                     uwrite!(
                         self.src,
                         r"
@@ -2826,7 +2860,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
                 self.src.push_str("nil");
             }
             self.src.push_str(",\n");
-            for (i, ty) in func.results.iter_types().enumerate() {
+            for (i, ty) in func.result.iter().enumerate() {
                 let (nested, fut) = async_paths_ty(self.resolve, ty);
                 for path in nested {
                     uwrite!(self.src, "{wrpc}.NewSubscribePath().Index({i})");
@@ -2904,7 +2938,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             );
 
             let mut idx = 0usize;
-            for (i, rty) in func.results.iter_types().enumerate() {
+            for (i, rty) in func.result.iter().enumerate() {
                 for (j, ty) in flatten_ty(self.resolve, rty).enumerate() {
                     uwrite!(
                         self.src,
@@ -2927,6 +2961,26 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
                     );
                     idx = idx.saturating_add(1);
                 }
+            }
+            if func.result.is_none() {
+                // A function with no results still completes with an (empty)
+                // result transmission; await it so the call is synchronous and
+                // the invocation's server-side effects are observable on return.
+                // The framed reader signals a closed result stream with
+                // `io.ErrUnexpectedEOF`, which is the expected terminator here.
+                let io = self.deps.io();
+                let errors = self.deps.errors();
+                let fmt = self.deps.fmt();
+                uwrite!(
+                    self.src,
+                    r#"
+    if _, err__ = {io}.ReadAll(r__); err__ != nil && !{errors}.Is(err__, {io}.EOF) && !{errors}.Is(err__, {io}.ErrUnexpectedEOF) {{
+        err__ = {fmt}.Errorf("failed to await `{name}` completion: %w", err__)
+        return
+    }}
+    err__ = nil"#,
+                    name = func.name,
+                );
             }
             uwriteln!(
                 self.src,
@@ -2963,9 +3017,9 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             self.deps,
         );
         let map = if self.in_import {
-            &mut self.gen.import_modules
+            &mut self.r#gen.import_modules
         } else {
-            &mut self.gen.export_modules
+            &mut self.r#gen.export_modules
         };
         map.push((module, module_path));
     }
@@ -2985,7 +3039,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         }
     }
 
-    fn godoc_params(&mut self, docs: &[(String, Type)], header: &str) {
+    fn godoc_params(&mut self, docs: &[Param], header: &str) {
         let _ = (docs, header);
         // let docs = docs
         //     .iter()
@@ -3040,7 +3094,10 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             let wrpc = self.deps.wrpc();
             uwrite!(self.src, "wrpc__ {wrpc}.Invoker, ");
         }
-        for (name, param) in &func.params {
+        for Param {
+            name, ty: param, ..
+        } in &func.params
+        {
             self.push_str(&to_go_ident(name));
             self.push_str(" ");
             self.print_opt_ty(param, true);
@@ -3065,6 +3122,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             Type::F64 => self.push_str("float64"),
             Type::Char => self.push_str("rune"),
             Type::String => self.push_str("string"),
+            Type::ErrorContext => self.push_str("struct{}"),
         }
     }
 
@@ -3076,10 +3134,10 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
     }
 
     fn type_path_with_name(&mut self, id: TypeId, name: String) -> String {
-        if let TypeOwner::Interface(id) = self.resolve.types[id].owner {
-            if let Some(path) = self.path_to_interface(id) {
-                return format!("{path}.{name}");
-            }
+        if let TypeOwner::Interface(id) = self.resolve.types[id].owner
+            && let Some(path) = self.path_to_interface(id)
+        {
+            return format!("{path}.{name}");
         }
         name
     }
@@ -3093,17 +3151,13 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
                 | TypeDefKind::Handle(..) => {}
                 TypeDefKind::List(..) if result => {}
                 TypeDefKind::Tuple(Tuple { types }) if types.len() == 1 => {
-                    return self.nillable_ptr(&types[0], result, decl)
+                    return self.nillable_ptr(&types[0], result, decl);
                 }
                 TypeDefKind::Type(ty) => return self.nillable_ptr(ty, result, decl),
                 _ => return "",
             }
         }
-        if decl {
-            "*"
-        } else {
-            "&"
-        }
+        if decl { "*" } else { "&" }
     }
 
     fn print_nillable_ptr(&mut self, ty: &Type, result: bool, decl: bool) {
@@ -3183,16 +3237,17 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             Type::F64 => self.push_str("float64"),
             Type::Char => self.push_str("rune"),
             Type::String => self.push_str("string"),
+            Type::ErrorContext => self.push_str("struct{}"),
         }
     }
 
     fn print_option(&mut self, ty: &Type, decl: bool) {
-        if let Type::Id(id) = ty {
-            if let TypeDefKind::List(t) = self.resolve.types[*id].kind {
-                // Go slices are pointer types
-                self.print_list(&t);
-                return;
-            }
+        if let Type::Id(id) = ty
+            && let TypeDefKind::List(t) = self.resolve.types[*id].kind
+        {
+            // Go slices are pointer types
+            self.print_list(&t);
+            return;
         }
         if decl {
             self.push_str("*");
@@ -3255,7 +3310,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         }
     }
 
-    fn print_stream(&mut self, Stream { element, .. }: &Stream) {
+    fn print_stream(&mut self, element: &Option<Type>) {
         match element {
             Some(ty) if is_ty(self.resolve, Type::U8, ty) => {
                 let io = self.deps.io();
@@ -3300,6 +3355,10 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
         }
         match &ty.kind {
             TypeDefKind::List(ty) => self.print_list(ty),
+            TypeDefKind::FixedLengthList(..) => {
+                panic!("unsupported anonymous type reference: fixed size list")
+            }
+            TypeDefKind::Map(..) => panic!("unsupported anonymous type reference: map"),
             TypeDefKind::Option(ty) => self.print_option(ty, decl),
             TypeDefKind::Result(ty) => self.print_result(ty),
             TypeDefKind::Variant(_) => panic!("unsupported anonymous variant"),
@@ -3339,11 +3398,11 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
             import_name,
             import_path,
             ..
-        } = &self.gen.interface_names[&interface];
-        if let Identifier::Interface(cur, _) = self.identifier {
-            if cur == interface {
-                return None;
-            }
+        } = &self.r#gen.interface_names[&interface];
+        if let Identifier::Interface(cur, _) = self.identifier
+            && cur == interface
+        {
+            return None;
         }
         Some(self.deps.import(import_name.clone(), import_path.clone()))
     }
@@ -3353,7 +3412,7 @@ func ServeInterface(s {wrpc}.Server, h Handler) (stop func() error, err error) {
     }
 
     fn info(&self, ty: TypeId) -> TypeInfo {
-        self.gen.types.get(ty)
+        self.r#gen.types.get(ty)
     }
 }
 
@@ -3373,7 +3432,7 @@ impl<'a> wit_bindgen_core::InterfaceGenerator<'a> for InterfaceGenerator<'a> {
         if let Some(name) = self.name_of(id) {
             self.godoc(docs);
             uwriteln!(self.src, "type {name} struct {{");
-            for Field { name, ty, docs } in fields {
+            for Field { name, ty, docs, .. } in fields {
                 self.godoc(docs);
                 self.push_str(&name.to_upper_camel_case());
                 self.push_str(" ");
@@ -3486,7 +3545,7 @@ func (v *{name}) WriteToIndex(w {wrpc}.ByteWriter) (func({wrpc}.IndexWriter) err
             // Struct
             self.godoc(docs);
             uwriteln!(self.src, "type {name} struct {{");
-            for Flag { name, docs } in &ty.flags {
+            for Flag { name, docs, .. } in &ty.flags {
                 self.godoc(docs);
                 self.push_str(&name.to_upper_camel_case());
                 self.push_str(" bool\n");
@@ -3562,6 +3621,15 @@ func (v *{name}) WriteToIndex(w {wrpc}.ByteWriter) (func({wrpc}.IndexWriter) err
                 );
             }
 
+            // Number of meaningful bits in the final byte. When the flag count
+            // is an exact multiple of 8 the last byte is fully used, so the
+            // shift must be 8 (not `len % 8 == 0`, which would reject every
+            // set bit in that byte as "unassociated").
+            let last_byte_bits = if ty.flags.is_empty() {
+                0
+            } else {
+                (ty.flags.len() - 1) % 8 + 1
+            };
             uwriteln!(
                 self.src,
                 r#"
@@ -3569,7 +3637,7 @@ func (v *{name}) WriteToIndex(w {wrpc}.ByteWriter) (func({wrpc}.IndexWriter) err
         return {errors}.New("bit not associated with any flag is set")
     }}"#,
                 buf_len - 1,
-                ty.flags.len() % 8,
+                last_byte_bits,
             );
             self.push_str("return nil\n}\n");
 
@@ -3639,6 +3707,7 @@ func (v *{name}) WriteToIndex(w {wrpc}.ByteWriter) (func({wrpc}.IndexWriter) err
                 name: case_name,
                 ty,
                 docs,
+                ..
             } in &variant.cases
             {
                 let camel = case_name.to_upper_camel_case();
@@ -3864,10 +3933,43 @@ func (v *{name}) WriteToIndex(w {wrpc}.ByteWriter) (func({wrpc}.IndexWriter) err
         }
     }
 
+    fn type_fixed_length_list(
+        &mut self,
+        _id: TypeId,
+        _name: &str,
+        _ty: &Type,
+        _size: u32,
+        _docs: &Docs,
+    ) {
+        panic!("unsupported type: fixed length list")
+    }
+
+    fn type_map(&mut self, _id: TypeId, _name: &str, _key: &Type, _value: &Type, _docs: &Docs) {
+        panic!("unsupported type: map")
+    }
+
     fn type_builtin(&mut self, _id: TypeId, name: &str, ty: &Type, docs: &Docs) {
         self.godoc(docs);
         uwrite!(self.src, "type {} = ", name.to_upper_camel_case());
         self.print_ty(ty, true);
         self.src.push_str("\n");
+    }
+
+    fn type_future(&mut self, id: TypeId, _name: &str, ty: &Option<Type>, docs: &Docs) {
+        if let Some(name) = self.name_of(id) {
+            self.godoc(docs);
+            uwrite!(self.src, "type {name} = ");
+            self.print_future(ty);
+            self.push_str("\n");
+        }
+    }
+
+    fn type_stream(&mut self, id: TypeId, _name: &str, ty: &Option<Type>, docs: &Docs) {
+        if let Some(name) = self.name_of(id) {
+            self.godoc(docs);
+            uwrite!(self.src, "type {name} = ");
+            self.print_stream(ty);
+            self.push_str("\n");
+        }
     }
 }

@@ -1,8 +1,8 @@
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, bail};
 use clap::Parser;
 use std::path::PathBuf;
 use std::str;
-use wit_bindgen_core::{wit_parser, Files, WorldGenerator};
+use wit_bindgen_core::{Files, WorldGenerator, wit_parser};
 use wit_parser::Resolve;
 
 /// Helper for passing VERSION to opt.
@@ -28,6 +28,12 @@ enum Opt {
         opts: wit_bindgen_wrpc_go::Opts,
         #[clap(flatten)]
         args: Common,
+    },
+
+    // doc-comments are present on `wit_bindgen_wrpc_test::Opts` for clap to use.
+    Test {
+        #[clap(flatten)]
+        opts: wit_bindgen_wrpc_test::Opts,
     },
 }
 
@@ -82,6 +88,10 @@ fn main() -> Result<()> {
     let (generator, opt) = match Opt::parse() {
         Opt::Rust { opts, args } => (opts.build(), args),
         Opt::Go { opts, args } => (opts.build(), args),
+        Opt::Test { opts } => {
+            let exe = std::env::args_os().next().unwrap();
+            return opts.run(std::path::Path::new(&exe));
+        }
     };
 
     gen_world(generator, &opt, &mut files).map_err(attach_with_context)?;
@@ -101,14 +111,15 @@ fn main() -> Result<()> {
                 // problem is directly.
                 if let (Ok(utf8_prev), Ok(utf8_contents)) =
                     (str::from_utf8(&prev), str::from_utf8(contents))
-                {
-                    if !utf8_prev
+                    && !utf8_prev
                         .chars()
                         .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
-                        && utf8_prev.lines().eq(utf8_contents.lines())
-                    {
-                        bail!("{} differs only in line endings (CRLF vs. LF). If this is a text file, configure git to mark the file as `text eol=lf`.", dst.display());
-                    }
+                    && utf8_prev.lines().eq(utf8_contents.lines())
+                {
+                    bail!(
+                        "{} differs only in line endings (CRLF vs. LF). If this is a text file, configure git to mark the file as `text eol=lf`.",
+                        dst.display()
+                    );
                 }
                 // The contents are binary or there are other differences; just
                 // issue a generic error.
@@ -156,8 +167,8 @@ fn gen_world(
         }
     }
     let (pkg, _files) = resolve.push_path(&opts.wit)?;
-    let world = resolve.select_world(pkg, opts.world.as_deref())?;
-    generator.generate(&resolve, world, files)?;
+    let world = resolve.select_world(&[pkg], opts.world.as_deref())?;
+    generator.generate(&mut resolve, world, files)?;
 
     Ok(())
 }

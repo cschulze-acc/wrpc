@@ -4,12 +4,12 @@ use anyhow::Context as _;
 use clap::Parser;
 use core::net::SocketAddr;
 use quinn::Endpoint;
-use quinn::{crypto::rustls::QuicClientConfig, ClientConfig};
+use quinn::{ClientConfig, crypto::rustls::QuicClientConfig};
 use rustls::{
+    DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
     version::TLS13,
-    DigitallySignedStruct, SignatureScheme,
 };
 
 mod bindings {
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(conf, addr, "localhost")?
         .await
         .context("failed to connect to server")?;
-    let wrpc = wrpc_transport_quic::Client::from(connection);
+    let wrpc = wrpc_quic::Client::from(connection);
     let hello = bindings::wrpc_examples::hello::handler::hello(&wrpc, ())
         .await
         .context("failed to invoke `wrpc-examples.hello/handler.hello`")?;

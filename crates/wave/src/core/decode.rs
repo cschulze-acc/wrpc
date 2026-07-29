@@ -1,6 +1,6 @@
 //! Async value decoder for wasm-wave types
 //!
-//! This module provides `read_value`, which mirrors `wrpc_runtime_wasmtime::codec::read_value`
+//! This module provides `read_value`, which mirrors `wrpc_wasmtime::codec::read_value`
 //! but works with `wasm_wave::value::Value` instead of `wasmtime::component::Val`.
 //!
 //! ## Design
@@ -26,14 +26,14 @@ use std::pin::Pin;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 use wasm_tokio::{
-    cm::AsyncReadValue as _, AsyncReadCore as _, AsyncReadLeb128 as _, AsyncReadUtf8 as _,
+    AsyncReadCore as _, AsyncReadLeb128 as _, AsyncReadUtf8 as _, cm::AsyncReadValue as _,
 };
 use wasm_wave::value::{Type, Value};
 use wasm_wave::wasm::{WasmType, WasmTypeKind, WasmValue as _};
 
 /// Read a wasm-wave `Value` from an async reader
 ///
-/// This mirrors `wrpc_runtime_wasmtime::codec::read_value`
+/// This mirrors `wrpc_wasmtime::codec::read_value`
 /// but without the `Index<R>` trait bound and `path` parameter,
 /// since wasm-wave doesn't support resources, async or streams
 ///
@@ -151,9 +151,9 @@ where
                 .try_into()
                 .map_err(|_| io_error("variant discriminant too large"))?;
 
-            let (case_name, payload_type) = cases.get(discriminant_idx).ok_or_else(|| {
-                io_error(format!("unknown variant discriminant: {}", discriminant))
-            })?;
+            let (case_name, payload_type) = cases
+                .get(discriminant_idx)
+                .ok_or_else(|| io_error(format!("unknown variant discriminant: {discriminant}")))?;
 
             let payload = if let Some(payload_type) = payload_type {
                 let value = Box::pin(read_value(r, payload_type)).await?;
@@ -174,7 +174,7 @@ where
 
             let name = names
                 .get(discriminant_idx)
-                .ok_or_else(|| io_error(format!("unknown enum discriminant: {}", discriminant)))?;
+                .ok_or_else(|| io_error(format!("unknown enum discriminant: {discriminant}")))?;
 
             Value::make_enum(ty, name).map_err(io_error)
         }
@@ -214,7 +214,7 @@ where
                     Value::make_result(ty, Err(None))
                 }
             } else {
-                return Err(io_error(format!("invalid result discriminant: {}", ok)));
+                return Err(io_error(format!("invalid result discriminant: {ok}")));
             }
             .map_err(io_error)
         }

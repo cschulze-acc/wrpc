@@ -3,16 +3,16 @@
 use core::future::Future;
 
 use bytes::Bytes;
-use tokio::io::{duplex, split, AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadHalf, WriteHalf, duplex, split};
 use tracing::instrument;
 
-use crate::frame::{invoke, Incoming, Outgoing};
-use crate::{Accept, Invoke};
+use crate::Invoke;
+use crate::frame::{Incoming, Outgoing, invoke};
 
-/// [Invoke] and [Accept] implementation in terms of a single stream pair.
+/// [Invoke] implementation in terms of a single stream pair.
 ///
-/// Either [`Invoke::invoke`] or [`Accept::accept`] can only be called at most once
-/// on [Oneshot], repeated calls with return an error
+/// [`Invoke::invoke`] can only be called at most once on [Oneshot],
+/// repeated calls will return an error.
 #[derive(Debug)]
 pub struct Oneshot<I, O>(std::sync::Mutex<Option<(I, O)>>);
 
@@ -29,10 +29,11 @@ impl From<DuplexStream> for Oneshot<ReadHalf<DuplexStream>, WriteHalf<DuplexStre
 }
 
 impl Oneshot<ReadHalf<DuplexStream>, WriteHalf<DuplexStream>> {
-    /// Creates a pair of connected [Oneshot] using [tokio::io::duplex].
-    pub fn duplex(max_buf_size: usize) -> (Self, Self) {
-        let (a, b) = duplex(max_buf_size);
-        (a.into(), b.into())
+    /// Creates a pair of [Oneshot] and server-side [`DuplexStream`] using [`tokio::io::duplex`].
+    #[must_use]
+    pub fn duplex(max_buf_size: usize) -> (Self, DuplexStream) {
+        let (clt, srv) = duplex(max_buf_size);
+        (clt.into(), srv)
     }
 }
 
@@ -58,8 +59,6 @@ where
     O: AsyncWrite + Send + Unpin + 'static,
 {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     async fn invoke<P>(
         &self,
@@ -68,7 +67,7 @@ where
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> anyhow::Result<(Self::Outgoing, Self::Incoming)>
+    ) -> anyhow::Result<(Outgoing, Incoming)>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -82,8 +81,6 @@ where
     O: AsyncWrite + Send + Unpin + 'static,
 {
     type Context = ();
-    type Outgoing = Outgoing;
-    type Incoming = Incoming;
 
     #[instrument(level = "trace", skip(self, paths, params), fields(params = format!("{params:02x?}")))]
     fn invoke<P>(
@@ -93,7 +90,7 @@ where
         func: &str,
         params: Bytes,
         paths: impl AsRef<[P]> + Send,
-    ) -> impl Future<Output = anyhow::Result<(Self::Outgoing, Self::Incoming)>>
+    ) -> impl Future<Output = anyhow::Result<(Outgoing, Incoming)>>
     where
         P: AsRef<[Option<usize>]> + Send + Sync,
     {
@@ -102,35 +99,5 @@ where
             let (rx, tx) = stream?;
             invoke(tx, rx, instance, func, params, paths).await
         }
-    }
-}
-
-impl<I, O> Accept for Oneshot<I, O>
-where
-    I: AsyncRead + Send + Sync + Unpin + 'static,
-    O: AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    type Context = ();
-    type Outgoing = O;
-    type Incoming = I;
-
-    async fn accept(&self) -> std::io::Result<(Self::Context, Self::Outgoing, Self::Incoming)> {
-        (&self).accept().await
-    }
-}
-
-impl<I, O> Accept for &Oneshot<I, O>
-where
-    I: AsyncRead + Send + Sync + Unpin + 'static,
-    O: AsyncWrite + Send + Sync + Unpin + 'static,
-{
-    type Context = ();
-    type Outgoing = O;
-    type Incoming = I;
-
-    #[instrument(level = "trace", skip(self))]
-    async fn accept(&self) -> std::io::Result<(Self::Context, Self::Outgoing, Self::Incoming)> {
-        let (rx, tx) = self.try_take_inner()?;
-        Ok(((), tx, rx))
     }
 }

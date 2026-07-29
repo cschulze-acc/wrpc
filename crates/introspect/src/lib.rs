@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, VecDeque};
 
 use wit_parser::{
-    Case, Field, Flags, Function, FunctionKind, Handle, Int, Record, Resolve, Stream, Type,
-    TypeDefKind, TypeId,
+    Case, Field, Flags, Function, FunctionKind, Handle, Int, Record, Resolve, Type, TypeDefKind,
+    TypeId,
 };
 
 #[must_use]
@@ -30,6 +30,15 @@ pub fn rpc_func_name(func: &Function) -> &str {
             .name
             .strip_prefix("[method]")
             .expect("failed to strip `[method]` prefix"),
+        FunctionKind::AsyncStatic(..) => func
+            .name
+            .strip_prefix("[static]")
+            .expect("failed to strip `[static]` prefix"),
+        FunctionKind::AsyncMethod(..) => func
+            .name
+            .strip_prefix("[method]")
+            .expect("failed to strip `[method]` prefix"),
+        FunctionKind::AsyncFreestanding => &func.name,
         FunctionKind::Freestanding => &func.name,
     }
 }
@@ -41,11 +50,11 @@ pub fn is_ty(resolve: &Resolve, expected: Type, ty: &Type) -> bool {
         if ty == expected {
             return true;
         }
-        if let Type::Id(id) = ty {
-            if let TypeDefKind::Type(t) = resolve.types[id].kind {
-                ty = t;
-                continue;
-            }
+        if let Type::Id(id) = ty
+            && let TypeDefKind::Type(t) = resolve.types[id].kind
+        {
+            ty = t;
+            continue;
         }
         return false;
     }
@@ -100,6 +109,18 @@ pub fn async_paths_ty(resolve: &Resolve, ty: &Type) -> (BTreeSet<VecDeque<Option
 pub fn async_paths_tyid(resolve: &Resolve, id: TypeId) -> (BTreeSet<VecDeque<Option<u32>>>, bool) {
     match &resolve.types[id].kind {
         TypeDefKind::List(ty) => {
+            let mut paths = BTreeSet::default();
+            let (nested, fut) = async_paths_ty(resolve, ty);
+            for mut path in nested {
+                path.push_front(None);
+                paths.insert(path);
+            }
+            if fut {
+                paths.insert(vec![None].into());
+            }
+            (paths, false)
+        }
+        TypeDefKind::FixedLengthList(ty, _) => {
             let mut paths = BTreeSet::default();
             let (nested, fut) = async_paths_ty(resolve, ty);
             for mut path in nested {
@@ -188,7 +209,7 @@ pub fn async_paths_tyid(resolve: &Resolve, id: TypeId) -> (BTreeSet<VecDeque<Opt
             }
             (paths, true)
         }
-        TypeDefKind::Stream(Stream { element, .. }) => {
+        TypeDefKind::Stream(element) => {
             let mut paths = BTreeSet::new();
             if let Some(ty) = element {
                 let (nested, fut) = async_paths_ty(resolve, ty);
@@ -206,6 +227,7 @@ pub fn async_paths_tyid(resolve: &Resolve, id: TypeId) -> (BTreeSet<VecDeque<Opt
         TypeDefKind::Resource
         | TypeDefKind::Flags(..)
         | TypeDefKind::Enum(..)
+        | TypeDefKind::Map(..)
         | TypeDefKind::Handle(Handle::Own(..) | Handle::Borrow(..)) => (BTreeSet::default(), false),
         TypeDefKind::Unknown => unreachable!(),
     }

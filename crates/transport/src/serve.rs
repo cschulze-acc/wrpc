@@ -6,36 +6,36 @@ use core::pin::Pin;
 
 use std::sync::Arc;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use futures::{SinkExt as _, Stream, TryStreamExt as _};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{debug, instrument, trace, Instrument as _, Span};
+use tracing::{Instrument as _, Span, debug, instrument, trace};
 
-use crate::{Deferred as _, Incoming, Index, TupleDecode, TupleEncode};
+use crate::frame::{Incoming, Outgoing};
+use crate::{BufferedIncoming, Deferred as _, TupleDecode, TupleEncode};
 
 /// Server-side handle to a wRPC transport
+///
+/// Invocations are always multiplexed over the wRPC framing layer, so the outgoing and
+/// incoming byte streams are the framed [`Outgoing`] and [`Incoming`] streams regardless of
+/// the underlying transport.
 pub trait Serve: Sync {
     /// Transport-specific invocation context
     type Context: Send + Sync + 'static;
-
-    /// Outgoing multiplexed byte stream
-    type Outgoing: AsyncWrite + Index<Self::Outgoing> + Send + Sync + Unpin + 'static;
-
-    /// Incoming multiplexed byte stream
-    type Incoming: AsyncRead + Index<Self::Incoming> + Send + Sync + Unpin + 'static;
 
     /// Serve function `func` from instance `instance`
     fn serve(
         &self,
         instance: &str,
         func: &str,
-        paths: impl Into<Arc<[Box<[Option<usize>]>]>> + Send,
+        paths: Arc<[Box<[Option<usize>]>]>,
     ) -> impl Future<
         Output = anyhow::Result<
-            impl Stream<Item = anyhow::Result<(Self::Context, Self::Outgoing, Self::Incoming)>>
-                + Send
-                + 'static,
+            impl Stream<Item = anyhow::Result<(Self::Context, Outgoing, Incoming)>>
+            + Send
+            + 'static
+            + use<Self>,
         >,
     > + Send;
 }
@@ -48,28 +48,37 @@ pub trait ServeExt: Serve {
         &self,
         instance: &str,
         func: &str,
-        paths: impl Into<Arc<[Box<[Option<usize>]>]>> + Send,
+        paths: Arc<[Box<[Option<usize>]>]>,
     ) -> impl Future<
         Output = anyhow::Result<
             impl Stream<
-                    Item = anyhow::Result<(
-                        Self::Context,
-                        Params,
-                        Option<impl Future<Output = std::io::Result<()>> + Send + Unpin + 'static>,
-                        impl FnOnce(
-                                Results,
-                            ) -> Pin<
-                                Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>,
-                            > + Send
-                            + 'static,
-                    )>,
-                > + Send
-                + 'static,
+                Item = anyhow::Result<(
+                    Self::Context,
+                    Params,
+                    Option<
+                        impl Future<Output = std::io::Result<()>>
+                        + Send
+                        + Unpin
+                        + 'static
+                        + use<Self, Params, Results>,
+                    >,
+                    impl FnOnce(
+                        Results,
+                    )
+                        -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'static>>
+                    + Send
+                    + 'static
+                    + use<Self, Params, Results>,
+                )>,
+            >
+            + Send
+            + 'static
+            + use<Self, Params, Results>,
         >,
     > + Send
     where
-        Params: TupleDecode<Self::Incoming> + Send + 'static,
-        Results: TupleEncode<Self::Outgoing> + Send + 'static,
+        Params: TupleDecode + Send + 'static,
+        Results: TupleEncode + Send + 'static,
         <Params::Decoder as tokio_util::codec::Decoder>::Error:
             std::error::Error + Send + Sync + 'static,
         <Results::Encoder as tokio_util::codec::Encoder<Results>>::Error:
@@ -98,7 +107,7 @@ pub trait ServeExt: Serve {
                         params,
                         rx.map(|f| {
                             f(
-                                Incoming {
+                                BufferedIncoming {
                                     buffer,
                                     inner: dec.into_inner(),
                                 },
@@ -145,21 +154,17 @@ impl<T: Serve> ServeExt for T {}
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use futures::{stream, StreamExt as _, TryStreamExt as _};
-
-    use crate::Captures;
+    use futures::{StreamExt as _, TryStreamExt as _, stream};
 
     use super::*;
 
-    async fn call_serve<T: Serve>(
-        s: &T,
-    ) -> anyhow::Result<Vec<(T::Context, T::Outgoing, T::Incoming)>> {
+    async fn call_serve<T: Serve>(s: &T) -> anyhow::Result<Vec<(T::Context, Outgoing, Incoming)>> {
         let st = stream::empty()
             .chain({
                 s.serve(
                     "foo",
                     "bar",
-                    [Box::from([Some(42), None]), Box::from([None])],
+                    Arc::from([Box::from([Some(42), None]), Box::from([None])]),
                 )
                 .await
                 .unwrap()
@@ -168,7 +173,7 @@ mod tests {
                 s.serve(
                     "foo",
                     "bar",
-                    vec![Box::from([Some(42), None]), Box::from([None])],
+                    Arc::from([Box::from([Some(42), None]), Box::from([None])]),
                 )
                 .await
                 .unwrap()
@@ -177,7 +182,7 @@ mod tests {
                 s.serve(
                     "foo",
                     "bar",
-                    [Box::from([Some(42), None]), Box::from([None])].as_slice(),
+                    Arc::from([Box::from([Some(42), None]), Box::from([None])]),
                 )
                 .await
                 .unwrap()
@@ -191,11 +196,11 @@ mod tests {
         s: &T,
     ) -> impl Future<
         Output = anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<T::Context>> + 'static>>>,
-    > + Captures<'_> {
+    > {
         let fut = s.serve(
             "foo",
             "bar",
-            [Box::from([Some(42), None]), Box::from([None])],
+            Arc::from([Box::from([Some(42), None]), Box::from([None])]),
         );
         async move {
             let st = fut.await.unwrap();
@@ -208,11 +213,11 @@ mod tests {
         s: &T,
     ) -> impl Future<
         Output = anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<T::Context>> + 'static>>>,
-    > + crate::Captures<'_> {
+    > {
         let fut = s.serve_values::<(Bytes,), (Bytes,)>(
             "foo",
             "bar",
-            [Box::from([Some(42), None]), Box::from([None])],
+            Arc::from([Box::from([Some(42), None]), Box::from([None])]),
         );
         async move {
             let st = fut.await.unwrap();

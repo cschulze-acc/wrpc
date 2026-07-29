@@ -11,29 +11,47 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["nats", "quic", "web-transport", "zenoh-transport"]
-nats = ["dep:async-nats", "async-nats/ring", "wrpc-cli/nats"]
-quic = [
-    "dep:quinn",
-    "quinn/log",
-    "quinn/platform-verifier",
-    "quinn/ring",
-    "quinn/runtime-tokio",
-    "quinn/rustls",
-]
-web-transport = ["dep:wtransport", "wtransport/self-signed"]
+default = ["http", "quic", "webtransport", "websockets", "zenoh-transport"]
+http = ["dep:http", "dep:hyper", "dep:hyper-util"]
+quic = ["dep:quinn"]
+webtransport = ["dep:wtransport"]
+websockets = ["dep:tokio-websockets"]
 zenoh-transport = ["dep:zenoh", "dep:wrpc-transport-zenoh", "wrpc-cli/zenoh-transport"]
 
 [dependencies]
 anyhow = { workspace = true }
-async-nats = { workspace = true, optional = true }
-quinn = { workspace = true, optional = true }
+futures = { workspace = true }
+http = { workspace = true, optional = true }
+hyper = { workspace = true, features = [
+    "client",
+    "http2",
+    "server",
+], optional = true }
+hyper-util = { workspace = true, features = ["tokio"], optional = true }
+quinn = { workspace = true, features = [
+    "log",
+    "platform-verifier",
+    "ring",
+    "runtime-tokio",
+    "rustls",
+], optional = true }
 rcgen = { workspace = true, features = ["crypto", "ring", "zeroize"] }
-rustls = { workspace = true, features = ["logging", "ring"] }
+rustls = { workspace = true, features = ["logging", "ring", "std"] }
 tokio = { workspace = true, features = ["net", "process", "rt-multi-thread"] }
+tokio-websockets = { workspace = true, features = [
+    "client",
+    "rand",
+    "ring",
+    "server",
+], optional = true }
 tracing = { workspace = true }
-wrpc-cli = { workspace = true }
-wtransport = { workspace = true, features = ["ring"], optional = true }
+wrpc-transport = { workspace = true }
+wtransport = { workspace = true, features = [
+    "ring",
+    "self-signed",
+], optional = true }
+
+
 wrpc-transport-zenoh = { workspace = true, optional = true }
 zenoh = { workspace = true, optional = true }
 serde_json = { workspace = true }

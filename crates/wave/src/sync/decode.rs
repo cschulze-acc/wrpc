@@ -1,4 +1,4 @@
-//! Synchronous wrapper for value decoder using futures::executor
+//! Synchronous wrapper for value decoder using `futures::executor`
 //!
 //! This module provides a synchronous wrapper around the async
 //! `read_value` function. It uses `futures::executor::block_on` which works
@@ -18,7 +18,7 @@
 
 use std::io::Cursor;
 
-use anyhow::{bail, Context as _};
+use anyhow::{Context as _, bail};
 use futures::executor::block_on;
 use wasm_wave::value::{Type, Value};
 

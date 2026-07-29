@@ -10,9 +10,11 @@
 //! - [Invoke] - the client-side handle to a wRPC transport, allowing clients to *invoke* WIT functions over wRPC transport
 //! - [Serve] - the server-side handle to a wRPC transport, allowing servers to *serve* WIT functions over wRPC transport
 //!
-//! Implementations of [Invoke] and [Serve] define transport-specific, multiplexed bidirectional byte stream types:
-//! - [`Invoke::Incoming`] and [`Serve::Incoming`] represent the stream *incoming* from a peer.
-//! - [`Invoke::Outgoing`] and [`Serve::Outgoing`] represent the stream *outgoing* to a peer.
+//! [Invoke] and [Serve] establish a single bidirectional byte stream per invocation, over which
+//! wRPC layers its [framing](frame) protocol to multiplex the nested async parameter and result
+//! sub-streams. Both therefore yield the framed [`frame::Outgoing`] and [`frame::Incoming`]
+//! streams regardless of the underlying transport, which only needs to provide any
+//! [`AsyncWrite`](tokio::io::AsyncWrite)/[`AsyncRead`](tokio::io::AsyncRead) byte stream.
 
 pub mod frame;
 pub mod invoke;
@@ -20,9 +22,7 @@ pub mod serve;
 
 mod value;
 
-pub use frame::{
-    Accept, Decoder as FrameDecoder, Encoder as FrameEncoder, Frame, FrameRef, Server,
-};
+pub use frame::{Decoder as FrameDecoder, Encoder as FrameEncoder, Frame, FrameRef, Server};
 pub use invoke::{Invoke, InvokeExt};
 pub use serve::{Serve, ServeExt};
 pub use value::*;
@@ -33,39 +33,26 @@ pub use frame::tcp;
 pub use frame::unix;
 
 use core::mem;
-use core::pin::{pin, Pin};
+use core::pin::{Pin, pin};
 use core::task::{Context, Poll};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, ReadBuf};
 use tracing::trace;
 
-/// Internal workaround trait
-///
-/// This is an internal trait used as a workaround for
-/// https://github.com/rust-lang/rust/issues/63033
-#[doc(hidden)]
-pub trait Captures<'a> {}
-
-impl<T: ?Sized> Captures<'_> for T {}
-
-/// Multiplexes streams
-///
-/// Implementations of this trait define multiplexing for underlying connections
-/// using a particular structural `path`
-pub trait Index<T> {
-    /// Index the entity using a structural `path`
-    fn index(&self, path: &[usize]) -> anyhow::Result<T>;
-}
-
 /// Buffered incoming stream used for decoding values
-pub struct Incoming<T> {
+///
+/// This wraps the multiplexed framed [`frame::Incoming`] stream with a read buffer used to
+/// hold bytes that were read ahead while decoding synchronous values.
+pub struct BufferedIncoming {
     buffer: BytesMut,
-    inner: T,
+    inner: frame::Incoming,
 }
 
-impl<T: Index<T>> Index<Self> for Incoming<T> {
-    fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
+impl BufferedIncoming {
+    /// Index the incoming stream using a structural `path`, returning a handle to the
+    /// multiplexed sub-stream addressed by it.
+    pub fn index(&self, path: &[usize]) -> anyhow::Result<Self> {
         let inner = self.inner.index(path)?;
         Ok(Self {
             buffer: BytesMut::default(),
@@ -74,7 +61,7 @@ impl<T: Index<T>> Index<Self> for Incoming<T> {
     }
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for Incoming<T> {
+impl AsyncRead for BufferedIncoming {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

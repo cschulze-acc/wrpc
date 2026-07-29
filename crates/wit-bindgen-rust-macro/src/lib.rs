@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use syn::parse::{Error, Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
-use syn::{braced, token, LitStr, Token};
+use syn::{LitStr, Token, braced, token};
 use wit_bindgen_core::wit_parser::{PackageId, Resolve, UnresolvedPackageGroup, WorldId};
 use wit_bindgen_wrpc_rust::{Opts, WithOption};
 
@@ -46,6 +46,7 @@ struct Config {
     resolve: Resolve,
     world: WorldId,
     files: Vec<PathBuf>,
+    debug: bool,
 }
 
 /// The source of the wit package definition
@@ -63,6 +64,7 @@ impl Parse for Config {
         let mut world = None;
         let mut source = None;
         let mut features = Vec::new();
+        let mut debug = false;
 
         if input.peek(token::Brace) {
             let content;
@@ -104,6 +106,10 @@ impl Parse for Config {
                             .map(|p| p.into_token_stream().to_string())
                             .collect();
                     }
+                    Opt::AdditionalDerivesIgnore(list) => {
+                        opts.additional_derive_ignore =
+                            list.into_iter().map(|i| i.value()).collect()
+                    }
                     Opt::With(with) => opts.with.extend(with),
                     Opt::GenerateAll => {
                         opts.generate_all = true;
@@ -113,6 +119,9 @@ impl Parse for Config {
                     }
                     Opt::Features(f) => {
                         features.extend(f.into_iter().map(|f| f.value()));
+                    }
+                    Opt::Debug(enable) => {
+                        debug = enable.value();
                     }
                     Opt::AnyhowPath(path) => {
                         opts.anyhow_path = Some(path.value());
@@ -157,6 +166,7 @@ impl Parse for Config {
             resolve,
             world,
             files,
+            debug,
         })
     }
 }
@@ -167,7 +177,7 @@ fn select_world(
     world: Option<&str>,
 ) -> anyhow::Result<WorldId> {
     if pkgs.len() == 1 {
-        resolve.select_world(pkgs[0], world)
+        resolve.select_world(pkgs, world)
     } else {
         assert!(!pkgs.is_empty());
         if let Some(name) = world {
@@ -180,11 +190,11 @@ fn select_world(
 
             // This will ignore the package argument due to the fully
             // qualified name being used.
-            resolve.select_world(pkgs[0], world)
+            resolve.select_world(pkgs, world)
         } else {
             let worlds = pkgs
                 .iter()
-                .filter_map(|p| resolve.select_world(*p, None).ok())
+                .filter_map(|p| resolve.select_world(&[*p], None).ok())
                 .collect::<Vec<_>>();
             match &worlds[..] {
                 [] => anyhow::bail!("no packages have a world"),
@@ -236,11 +246,11 @@ fn parse_source(
 }
 
 impl Config {
-    fn expand(self) -> Result<TokenStream> {
+    fn expand(mut self) -> Result<TokenStream> {
         let mut files = Default::default();
         let mut generator = self.opts.build();
         generator
-            .generate(&self.resolve, self.world, &mut files)
+            .generate(&mut self.resolve, self.world, &mut files)
             .map_err(|e| anyhow_to_syn(Span::call_site(), e))?;
         let (_, src) = files.iter().next().unwrap();
         let mut src = std::str::from_utf8(src).unwrap().to_string();
@@ -249,7 +259,7 @@ impl Config {
         // place a formatted version of the expanded code into a file. This file
         // will then show up in rustc error messages for any codegen issues and can
         // be inspected manually.
-        if std::env::var("WIT_BINDGEN_DEBUG").is_ok() {
+        if std::env::var("WIT_BINDGEN_DEBUG").is_ok() || self.debug {
             static INVOCATION: AtomicUsize = AtomicUsize::new(0);
             let root = Path::new(env!("DEBUG_OUTPUT_DIR"));
             let world_name = &self.resolve.worlds[self.world].name;
@@ -292,10 +302,12 @@ mod kw {
     syn::custom_keyword!(bitflags_path);
     syn::custom_keyword!(exports);
     syn::custom_keyword!(additional_derives);
+    syn::custom_keyword!(additional_derives_ignore);
     syn::custom_keyword!(with);
     syn::custom_keyword!(generate_all);
     syn::custom_keyword!(generate_unused_types);
     syn::custom_keyword!(features);
+    syn::custom_keyword!(debug);
     syn::custom_keyword!(anyhow_path);
     syn::custom_keyword!(bytes_path);
     syn::custom_keyword!(futures_path);
@@ -314,10 +326,12 @@ enum Opt {
     BitflagsPath(syn::LitStr),
     // Parse as paths so we can take the concrete types/macro names rather than raw strings
     AdditionalDerives(Vec<syn::Path>),
+    AdditionalDerivesIgnore(Vec<syn::LitStr>),
     With(HashMap<String, WithOption>),
     GenerateAll,
     GenerateUnusedTypes(syn::LitBool),
     Features(Vec<syn::LitStr>),
+    Debug(syn::LitBool),
     AnyhowPath(syn::LitStr),
     BytesPath(syn::LitStr),
     FuturesPath(syn::LitStr),
@@ -372,6 +386,13 @@ impl Parse for Opt {
             syn::bracketed!(contents in input);
             let list = Punctuated::<_, Token![,]>::parse_terminated(&contents)?;
             Ok(Opt::AdditionalDerives(list.iter().cloned().collect()))
+        } else if l.peek(kw::additional_derives_ignore) {
+            input.parse::<kw::additional_derives_ignore>()?;
+            input.parse::<Token![:]>()?;
+            let contents;
+            syn::bracketed!(contents in input);
+            let list = Punctuated::<_, Token![,]>::parse_terminated(&contents)?;
+            Ok(Opt::AdditionalDerivesIgnore(list.iter().cloned().collect()))
         } else if l.peek(kw::with) {
             input.parse::<kw::with>()?;
             input.parse::<Token![:]>()?;
@@ -394,6 +415,10 @@ impl Parse for Opt {
             syn::bracketed!(contents in input);
             let list = Punctuated::<_, Token![,]>::parse_terminated(&contents)?;
             Ok(Opt::Features(list.into_iter().collect()))
+        } else if l.peek(kw::debug) {
+            input.parse::<kw::debug>()?;
+            input.parse::<Token![:]>()?;
+            Ok(Opt::Debug(input.parse()?))
         } else if l.peek(kw::anyhow_path) {
             input.parse::<kw::anyhow_path>()?;
             input.parse::<Token![:]>()?;

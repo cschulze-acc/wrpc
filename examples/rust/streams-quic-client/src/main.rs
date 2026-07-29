@@ -5,13 +5,13 @@ use anyhow::Context as _;
 use bytes::Bytes;
 use clap::Parser;
 use core::net::SocketAddr;
-use futures::{stream, StreamExt as _};
-use quinn::{crypto::rustls::QuicClientConfig, ClientConfig, Endpoint};
+use futures::{StreamExt as _, stream};
+use quinn::{ClientConfig, Endpoint, crypto::rustls::QuicClientConfig};
 use rustls::{
+    DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
     version::TLS13,
-    DigitallySignedStruct, SignatureScheme,
 };
 use tokio::{time, try_join};
 use tokio_stream::wrappers::IntervalStream;
@@ -25,7 +25,7 @@ mod bindings {
     });
 }
 
-use bindings::wrpc_examples::streams::handler::{echo, Req};
+use bindings::wrpc_examples::streams::handler::{Req, echo};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(conf, addr, "localhost")?
         .await
         .context("failed to connect to server")?;
-    let wrpc = wrpc_transport_quic::Client::from(connection);
+    let wrpc = wrpc_quic::Client::from(connection);
 
     let numbers = Box::pin(
         stream::iter(1..)
@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
             .map(Bytes::from),
     );
 
-    let (mut numbers, mut bytes, io) = echo(&wrpc, (), Req { numbers, bytes })
+    let ((mut numbers, mut bytes), io) = echo(&wrpc, (), Req { numbers, bytes })
         .await
         .context("failed to invoke `wrpc-examples:streams/handler.echo`")?;
     try_join!(

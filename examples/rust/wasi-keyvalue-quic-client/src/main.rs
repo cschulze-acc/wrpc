@@ -1,16 +1,16 @@
 use std::sync::Arc;
 
-use anyhow::{ensure, Context as _};
+use anyhow::{Context as _, ensure};
 use bytes::Bytes;
 use clap::Parser;
 use core::net::SocketAddr;
 use quinn::Endpoint;
-use quinn::{crypto::rustls::QuicClientConfig, ClientConfig};
+use quinn::{ClientConfig, crypto::rustls::QuicClientConfig};
 use rustls::{
+    DigitallySignedStruct, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     pki_types::{CertificateDer, ServerName, UnixTime},
     version::TLS13,
-    DigitallySignedStruct, SignatureScheme,
 };
 use wrpc_wasi_keyvalue::wasi::keyvalue::store;
 
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_with(conf, addr, "localhost")?
         .await
         .context("failed to connect to server")?;
-    let wrpc = wrpc_transport_quic::Client::from(connection);
+    let wrpc = wrpc_quic::Client::from(connection);
     let bucket = store::open(&wrpc, (), "example")
         .await
         .context("failed to invoke `open`")?

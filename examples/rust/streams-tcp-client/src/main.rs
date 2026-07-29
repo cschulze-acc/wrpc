@@ -3,7 +3,7 @@ use core::time::Duration;
 use anyhow::Context as _;
 use bytes::Bytes;
 use clap::Parser;
-use futures::{stream, StreamExt as _};
+use futures::{StreamExt as _, stream};
 use tokio::{time, try_join};
 use tokio_stream::wrappers::IntervalStream;
 use tracing::debug;
@@ -16,7 +16,7 @@ mod bindings {
     });
 }
 
-use bindings::wrpc_examples::streams::handler::{echo, Req};
+use bindings::wrpc_examples::streams::handler::{Req, echo};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
             .map(Bytes::from),
     );
 
-    let (mut numbers, mut bytes, io) = echo(&wrpc, (), Req { numbers, bytes })
+    let ((mut numbers, mut bytes), io) = echo(&wrpc, (), Req { numbers, bytes })
         .await
         .context("failed to invoke `wrpc-examples:streams/handler.echo`")?;
     try_join!(
